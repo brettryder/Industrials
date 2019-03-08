@@ -1,1 +1,1 @@
-# IndustrialsR Code for Industrial IPOs
+# Industrials R Code for Industrial IPOs
