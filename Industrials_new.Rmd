@@ -1,0 +1,3568 @@
+---
+title: "Industrials"
+author: "Brett Ryder"
+date: "30 January 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+setwd("~/Documents/IPOs")
+#library(readxl)
+library(readODS)
+library(dplyr)
+#library(stargazer)
+library(xtable)
+library(ggplot2)
+library(forecast)
+library(pdfetch)
+library(RWeka)
+library(zoo)
+library(tidyverse)
+library(glmnet)
+library(randomForest)
+library(rpart)
+library(caret)
+library(e1071)
+library(elasticnet)
+library(MASS)
+library(cvTools)
+library(ForecastComb)
+
+```
+
+#Data Description and Sources
+
+```{r Actual Company Data }
+
+#Reading in Company Data
+data <- read_ods("Industrials.ods", sheet = "data", skip = 2)
+data$Date_Prosp <- as.Date(data$Date_Prosp, origin="1899-12-30", "%d/%m/%y")
+data$Date_Open <- as.Date(data$Date_Open, origin="1899-12-30", "%d/%m/%y")
+data$Date_Close <- as.Date(data$Date_Close, origin="1899-12-30", "%d/%m/%y")
+data$Date_List <- as.Date(data$Date_List, origin="1899-12-30", "%d/%m/%y")
+data$Actual_List <- as.Date(data$Actual_List, origin="1899-12-30", "%d/%m/%y")
+
+#Total pro forma assets
+data$Assets <- (data$A_F_min+data$A_F_max)/2
+
+#Pro Forma Cash 
+data$Cash <- (data$Cash_min+data$Cash_max)/2
+
+#Pro Forma Liabilities
+data$Liab <- (data$L_F_min+data$L_F_max)/2
+
+#Net pro forma Assets 
+data$NetAssets <- data$Assets - data$Liab
+
+#Net pro forma Tangible Assets
+data$NetTangibleAssets <- data$NetAssets-(data$Int_F_max+data$Int_F_min)/2
+
+#Number of Shares and Options
+data$Shares <- (data$Shares_final_max + data$Shares_final_min)/2
+data$Options <- (data$Opts_max + data$Opts_min)/2
+data$SharesFD <- data$Shares+data$Options
+
+#Shortfall
+data$Shortfall <- data$Actual_raise/data$Offer_max
+  
+#Market Capitalisation 
+data$mc <- data$Price*data$SharesFD/1000000
+data$mcM <- data$Pclose*data$SharesFD/1000000
+
+#Enterprise Value (proforma)
+data$ev <- (data$mc - (data$Cash - data$Liab)/1000)
+data$evM <- (data$mcM-(data$Cash - data$Liab)/1000)
+
+#Issue Size
+data$issueSize <- (data$Offer_min+data$Offer_max)/2*data$Price
+
+#IPO Investor Share
+data$sIPO <- (data$Offer_max + data$Offer_min)/2/data$Shares
+
+#Management Share
+data$sMGT <- (data$Shares_mgt_final+data$Opts_initial+data$Opts_mgt)/data$SharesFD
+
+#Lead Manager Share
+data$sLM <- (data$Opts_broker+data$Shares_broker)/data$SharesFD
+
+#Top Holders Share
+data$sTOP <- data$topHolders.s/data$Shares
+
+#Escrow
+data$escrow <- data$Escrow/data$Shares
+
+#Time Offer Open
+data$timeOpen <- as.numeric(data$Date_Close-data$Date_Open)
+
+#Issue Range
+data$range <- log(data$Offer_max/data$Offer_min)
+
+#Issue Cost
+data$cost <- data$IPO_cost/(data$Price*(data$Offer_max/2 + data$Offer_min/2 + data$Shares_consideration))
+
+#Forecast Profits
+data$fcstEBIT <- ifelse(is.na(data$EBIT_F), 0, data$EBIT_F/data$Assets - data$EBIT_A/data$Assets)
+
+#Replacing NAs with zeros for sales, revenue,  EBIT & CFO
+data$EBIT_A <- ifelse(is.na(data$EBIT_A), 0, data$EBIT_A)
+data$Sales_A <- ifelse(is.na(data$Sales_A), 0, data$Sales_A)
+data$Rev_A <- ifelse(is.na(data$Rev_A), 0, data$Rev_A)
+
+#Gross Margin
+data$gMargin <- (data$Sales_A - data$COGS_A)/data$Sales_A
+
+#log of Price to book
+data$pb <- log(1000*data$mcM + data$Liab) - log(data$Assets)
+
+#log of PNTA
+data$pnta <- log(1000*data$mcM + data$Liab) - log(data$NetTangibleAssets + data$Liab)
+
+#Share Raise
+data$shareRaise <- (data$total - data$vendorSales - data$debtRepayment)/1000/data$Assets
+
+#Industry Groups
+data$Industry <- NA
+data$Industry <- ifelse(data$Division=="Agriculture Forestry and Fishing", "Agriculture", NA)
+data$Industry <- ifelse(data$Division %in% c("Finance and Insurance Services", "Rental Hiring and Real Estate Services"), "FIRE", data$Industry)
+data$Industry <- ifelse(data$Division %in% c("Retail Trade", "Wholesale Trade"), "Trade", data$Industry) 
+data$Industry <- ifelse(data$Division %in% c("Professional Scientific and Technical Services", "Administrative and Support Services", "Arts and Recreation Services", "Education and Training", "Healthcare and Social Assitance", "Other Services"), "Services", data$Industry)
+data$Industry <- ifelse(data$Division == "Information Media and Telecommunications", "Info", data$Industry)
+data$Industry <- ifelse(data$Division == "Manufacturing", "Manufacturing", data$Industry)
+data$Industry <- ifelse(data$Division == "SAAS", "SAAS", data$Industry)
+data$Industry <- ifelse(is.na(data$Industry), "Other", data$Industry)
+
+```
+
+
+```{r Broker and Auditor Size Calculations}
+
+#Broker Market Share Calculations
+broker.calc <- data[, c("Broker", "Broker2", "Broker3", "issueSize")]
+broker.calc$n <- ifelse(is.na(broker.calc$Broker3), 2, 3)
+broker.calc$n <- ifelse(is.na(broker.calc$Broker2), 1, broker.calc$n)
+broker.calc$issueSize <- broker.calc$issueSize/broker.calc$n
+
+broker.calc1 <- na.omit(broker.calc[, c("Broker", "issueSize")])
+broker.calc2 <- na.omit(broker.calc[, c("Broker2", "issueSize")])
+colnames(broker.calc2) <- colnames(broker.calc1)
+broker.calc3 <- na.omit(broker.calc[, c("Broker3", "issueSize")])
+colnames(broker.calc3) <- colnames(broker.calc1)
+
+broker.calc.row <- rbind(broker.calc1, broker.calc2, broker.calc3)
+broker.value <- aggregate(broker.calc.row$issueSize, by = list(Broker=broker.calc.row$Broker), FUN = sum)
+broker.value$share <- broker.value$x/sum(broker.value$x)
+broker.value <- broker.value[(order(-broker.value$share)), ]
+
+data$b1 <- NA
+data$b2 <- NA
+data$b3 <- NA
+data$b1 <- broker.value$share[match(data$Broker, broker.value$Broker)]
+data$b2 <- broker.value$share[match(data$Broker2, broker.value$Broker)]
+data$b3 <- broker.value$share[match(data$Broker3, broker.value$Broker)]
+
+data$broker.share <- NA
+data$broker.share <- ifelse(is.na(data$Broker2), data$b1, (data$b1+data$b2)/2)
+data$broker.share <- ifelse(is.na(data$Broker3), data$broker.share, (data$b1+data$b2+data$b3)/3)
+
+
+#Auditor Market Share Calculations
+auditor.calc <- data[, c("Auditor", "issueSize")]
+
+auditor.value <- aggregate(auditor.calc$issueSize, by = list(Auditor=auditor.calc$Auditor), FUN = sum)
+auditor.value$share <- auditor.value$x/sum(auditor.value$x)
+auditor.value <- auditor.value[(order(-auditor.value$share)), ]
+
+data$auditor.share <- NA
+data$auditor.share <- auditor.value$share[match(data$Auditor, auditor.value$Auditor)]
+
+```
+
+
+```{r Dowrloading YAHOO Price data}
+
+#Downloading historic stock specific prices
+for (i in 198:(length(data$Actual_List)-sum(is.na(data$Actual_List)))) {
+
+j <- na.locf(pdfetch_YAHOO(paste0(data$ASX_Code[i], ".AX"), from = as.Date(data$Actual_List[i]), to=Sys.Date(), interval="1d"))
+
+ratio <- j[, 5]/j[, 4]
+ratio <- ratio/mean(ratio[1])
+
+data$P1m[i] <- ifelse(nrow(j) >= 21, j[21, 4]*ratio[21], "NA")
+data$P2m[i] <- ifelse(nrow(j) >= 42, j[42, 4]*ratio[42], "NA")
+data$P3m[i] <- ifelse(nrow(j) >= 63, j[63, 4]*ratio[63], "NA")
+data$P4m[i] <- ifelse(nrow(j) >= 84, j[84, 4]*ratio[84], "NA")
+data$P5m[i] <- ifelse(nrow(j) >= 105, j[105, 4]*ratio[105], "NA")
+data$P6m[i] <- ifelse(nrow(j) >= 126, j[126, 4]*ratio[126], "NA")
+data$P7m[i] <- ifelse(nrow(j) >= 147, j[147, 4]*ratio[147], "NA")
+data$P8m[i] <- ifelse(nrow(j) >= 168, j[168, 4]*ratio[168], "NA")
+data$P9m[i] <- ifelse(nrow(j) >= 189, j[189, 4]*ratio[189], "NA")
+data$P10m[i] <- ifelse(nrow(j) >= 210, j[210, 4]*ratio[210], "NA")
+data$P11m[i] <- ifelse(nrow(j) >= 231, j[231, 4]*ratio[231], "NA")
+data$P12m[i] <- ifelse(nrow(j) >= 252, j[252, 4]*ratio[252], "NA")
+}
+
+
+data$P1m <- as.numeric(data$P1m)
+data$P2m <- as.numeric(data$P2m)
+data$P3m <- as.numeric(data$P3m)
+data$P4m <- as.numeric(data$P4m)
+data$P5m <- as.numeric(data$P5m)
+data$P6m <- as.numeric(data$P6m)
+data$P7m <- as.numeric(data$P7m)
+data$P8m <- as.numeric(data$P8m)
+data$P9m <- as.numeric(data$P9m)
+data$P10m <- as.numeric(data$P10m)
+data$P11m <- as.numeric(data$P11m)
+data$P12m <- as.numeric(data$P12m)
+
+#Data missing
+#RCL 7 Feb
+#data$P1m[data$ASX_Code == "RCL"] <- data$P1m[data$ASX_Code == "RCL"] + 0.075/2 
+#data$P2m[data$ASX_Code == "RCL"] <- data$P2m[data$ASX_Code == "RCL"] + 0.076/2
+#data$P3m[data$ASX_Code == "RCL"] <- data$P3m[data$ASX_Code == "RCL"] + 0.055/2
+#data$P4m[data$ASX_Code == "RCL"] <- data$P4m[data$ASX_Code == "RCL"] + 0.120/2
+#data$P5m[data$ASX_Code == "RCL"] <- data$P5m[data$ASX_Code == "RCL"] + 0.160/2
+#data$P6m[data$ASX_Code == "RCL"] <- data$P6m[data$ASX_Code == "RCL"] + 0.210/2
+#data$P7m[data$ASX_Code == "RCL"] <- data$P7m[data$ASX_Code == "RCL"] + 0.100/2
+#data$P8m[data$ASX_Code == "RCL"] <- data$P8m[data$ASX_Code == "RCL"] + 0.120/2
+#data$P9m[data$ASX_Code == "RCL"] <- data$P9m[data$ASX_Code == "RCL"] +  0.06/2
+#data$P10m[data$ASX_Code == "RCL"] <- data$P10m[data$ASX_Code == "RCL"] + 0.10/2
+#data$P11m[data$ASX_Code == "RCL"] <- data$P11m[data$ASX_Code == "RCL"] + 0.08/2
+#data$P12m[data$ASX_Code == "RCL"] <- data$P12m[data$ASX_Code == "RCL"] + 0.085/2
+#SharePrice index
+#j <- pdfetch_YAHOO("^AXJO", fields=c("close"), from = as.Date("2015-01-01"), to=Sys.Date(), interval="1d")
+
+#junk <- data[, c("Popen", "Pclose", "P1day", "P1week", "P1m", "P2m", "P3m", "P4m", "P5m", "P6m", "P7m", "P8m", "P9m", "P10m", "P11m", "P12m")]
+#write.csv(junk, file="junk.csv")
+
+```
+
+
+#Returns
+
+```{r Return Summary}
+
+n <- nrow(data)
+dataSummary <- matrix(NA, ncol=9, nrow=(n+5))
+rownames(dataSummary) <- c(data$Name, "", "Mean", "Median", "Max", "Min")
+colnames(dataSummary) <- c("ropen", "rclose", "r1d", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+dataSummary[1:n, 1] <- log(data$Popen/data$Price)
+dataSummary[1:n, 2] <- log(data$Pclose/data$Popen)
+dataSummary[1:n, 3] <- log(data$P1day/data$Pclose)
+dataSummary[1:n, 4] <- log(data$P1week/data$P1day)
+dataSummary[1:n, 5] <- log(data$P1m/data$P1week)
+dataSummary[1:n, 6] <- log(data$P3m/data$P1m)
+dataSummary[1:n, 7] <- log(data$P6m/data$P3m)
+dataSummary[1:n, 8] <- log(data$P9m/data$P6m)
+dataSummary[1:n, 9] <- log(data$P12m/data$P9m)
+
+dataSummary[(n+2), ] <- colMeans(dataSummary[1:n, ], na.rm=TRUE)
+dataSummary[(n+3), ] <- apply(dataSummary[1:n, ], 2, median, na.rm=TRUE)
+dataSummary[(n+4), ] <- apply(dataSummary[1:n, ], 2, max, na.rm=TRUE)
+dataSummary[(n+5), ] <- apply(dataSummary[1:n, ], 2, min, na.rm=TRUE)
+
+xtable(dataSummary)
+
+```
+
+
+```{r plotting average returns}
+
+#Barplot of returns by time period
+barplot(dataSummary[c("Mean", "Median"), ], beside=TRUE, main="Returns by Time Period")
+abline(h=0)
+
+#Histogram of Returns
+hist(log(data$Pclose/data$Price))
+abline(v = mean(log(data$Pclose/data$Price), na.rm=TRUE), col="red")
+hist(log(data$P12m/data$Price))
+abline(v = mean(log(data$P12m/data$Price), na.rm=TRUE), col="red")
+
+```
+
+
+```{r Returns by Size (revenue and Assets)}
+
+data$rclose <- log(data$Pclose/data$Price)
+data$r1d <- log(data$P1day/data$Price)
+data$r1w <- log(data$P1week/data$Price)
+data$r1m <- log(data$P1m/data$Price)
+data$r2m <- log(data$P2m/data$Price)
+data$r3m <- log(data$P3m/data$Price)
+data$r4m <- log(data$P4m/data$Price)
+data$r5m <- log(data$P5m/data$Price)
+data$r6m <- log(data$P6m/data$Price)
+data$r7m <- log(data$P7m/data$Price)
+data$r8m <- log(data$P8m/data$Price)
+data$r9m <- log(data$P9m/data$Price)
+data$r10m <- log(data$P10m/data$Price)
+data$r11m <- log(data$P11m/data$Price)
+data$r12m <- log(data$P12m/data$Price)
+
+
+#Returns for all companies
+dat <- data[, c("rclose", "r1d", "r1w", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+dat[nrow(dat)+1, ] <- colMeans(dat, na.rm=TRUE)
+dat[nrow(dat)+1, ] <- apply(dat, 2, median, na.rm=TRUE)
+barplot(as.matrix(dat[(nrow(dat)-1):nrow(dat), ]), beside=TRUE, main = "Cumulative Returns")
+
+#Returns by Revenue
+dat <- data[, c("Sales_A", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+cut.off <- 5000
+
+mat <- matrix(nrow=3, ncol=14)
+colnames(mat) <- colnames(dat)
+mat[1, ] <- colMeans(dat[dat$Sales_A == 0, ], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Sales_A > 0 & dat$Sales_A <= cut.off, ], na.rm=TRUE)
+mat[3, ] <- colMeans(dat[dat$Sales_A > cut.off, ], na.rm=TRUE)
+
+barplot(mat[, 2:ncol(dat)], beside=TRUE, main="Average Returns by Sales", legend.text = c("None", "Small", "Large"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$Sales_A == 0, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$Sales_A > 0 & dat$Sales_A <= cut.off, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[3, 2:ncol(mat.median)] <- apply(dat[dat$Sales_A > cut.off, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median[, 2:ncol(dat)], beside=TRUE, main="Median Returns by Sales", legend.text = c("None", "Small", "Large"), bty="n", args.legend=list(x = "topleft", bty = "n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$Sales_A == 0, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$Sales_A > 0 & dat$Sales_A <= cut.off, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[3, 2:ncol(mat.sd)] <- (apply(dat[dat$Sales_A > cut.off, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd[, 2:ncol(dat)], beside=TRUE, main="Standard Deviation of Returns by Sales", legend.text = c("None", "Small", "Large"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by Stage of Development (pre-revenue, revenue, profits)
+dat <- data[, c("Sales_A", "EBITDA_A", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat <- matrix(nrow=3, ncol=15)
+colnames(mat) <- colnames(dat)
+mat[1, ] <- colMeans(dat[dat$Sales_A==0, ], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Sales_A > 0 & dat$EBITDA_A <= 0, ], na.rm=TRUE)
+mat[3, ] <- colMeans(dat[dat$EBITDA_A > 0, ], na.rm=TRUE)
+
+barplot(mat[, 3:ncol(dat)], beside=TRUE, main="Average Returns by Stage", legend.text = c("No Sales", "No Profits", "Profits"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 3:ncol(mat.median)] <- apply(dat[dat$Sales_A == 0, 3:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 3:ncol(mat.median)] <- apply(dat[dat$Sales_A > 0 & dat$EBITDA_A <= 0, 3:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[3, 3:ncol(mat.median)] <- apply(dat[dat$EBITDA_A > 0, 3:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median[, 3:ncol(dat)], beside=TRUE, main="Median Returns by Stage", legend.text = c("No Sales", "No Profits", "Profits"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 3:ncol(mat.sd)] <- (apply(dat[dat$Sales_A == 0, 3:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 3:ncol(mat.sd)] <- (apply(dat[dat$Sales_A > 0 & dat$EBITDA_A <= 0, 3:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[3, 3:ncol(mat.sd)] <- (apply(dat[dat$EBITDA_A > 0, 3:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd[, 3:ncol(dat)], beside=TRUE, main="Standard Deviation of Returns by Stage", legend.text = c("No Sales", "No Profits", "Profits"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by Assets
+dat <- data[, c("Assets", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+cut.min <- 10000
+cut.off <- 50000
+
+mat <- matrix(nrow=3, ncol=14)
+colnames(mat) <- colnames(dat)
+mat[1, ] <- colMeans(dat[dat$Assets <= cut.min, ], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Assets > cut.min & dat$Assets <= cut.off, ], na.rm=TRUE)
+mat[3, ] <- colMeans(dat[dat$Assets > cut.off, ], na.rm=TRUE)
+
+barplot(mat[, 2:ncol(dat)], beside=TRUE, main="Average Returns by Assets", legend.text = c("Small", "Medium", "Large"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$Assets <= cut.min, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$Assets > cut.min & dat$Assets <= cut.off, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[3, 2:ncol(mat.median)] <- apply(dat[dat$Assets > cut.off, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median[, 2:ncol(dat)], beside=TRUE, main="Median Returns by Assets", legend.text = c("Small", "Medium", "Large"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$Assets <= cut.min, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$Assets > cut.min & dat$Assets <= cut.off, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[3, 2:ncol(mat.sd)] <- (apply(dat[dat$Assets > cut.off, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd[, 2:ncol(dat)], beside=TRUE, main="Standard Deviation of Returns by Assets", legend.text = c("Small", "Medium", "Large"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by OMBB
+dat <- data[, c("OMBB", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat <- matrix(nrow = 2, ncol = 13)
+colnames(mat) <- colnames(dat[2:ncol(dat)])
+mat[1, ] <- colMeans(dat[dat$OMBB == "YES", 2:ncol(dat)], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$OMBB == "NO", 2:ncol(dat)], na.rm=TRUE)
+
+barplot(mat[,], beside=TRUE, main="Average Returns OMBB", legend.text = c("YES", "NO"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$OMBB == "YES", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$OMBB == "NO", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median, beside=TRUE, main="Median Returns by OMBB", legend.text = c("YES", "NO"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$OMBB == "YES", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$OMBB == "NO", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd, beside=TRUE, main="Standard Deviation of Returns by OMBB", legend.text = c("YES", "NO"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by Underwritten
+dat <- data[, c("Underwritten", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat[1, ] <- colMeans(dat[dat$Underwritten == "YES", 2:ncol(dat)], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Underwritten == "NO", 2:ncol(dat)], na.rm=TRUE)
+
+barplot(mat, beside=TRUE, main="Average Returns Underwritten", legend.text = c("YES", "NO"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$Underwritten == "YES", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$Underwritten == "NO", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median, beside=TRUE, main="Median Returns by Underwritten", legend.text = c("YES", "NO"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$Underwritten == "YES", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$Underwritten == "NO", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd, beside=TRUE, main="Standard Deviation of Returns by Underwritten", legend.text = c("YES", "NO"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by Dividend
+dat <- data[, c("Dividend", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat[1, ] <- colMeans(dat[dat$Dividend == 0, 2:ncol(dat)], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Dividend > 0, 2:ncol(dat)], na.rm=TRUE)
+
+barplot(mat, beside=TRUE, main="Average Returns Dividend", legend.text = c("NO", "YES"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$Dividend == 0, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$Dividend > 0, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median, beside=TRUE, main="Median Returns by Dividend", legend.text = c("NO", "YES"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$Dividend == 0, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$Dividend > 0, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd, beside=TRUE, main="Standard Deviation of Returns by Dividend", legend.text = c("NO", "YES"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by Discipline
+dat <- data[, c("Discipline", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat[1, ] <- colMeans(dat[dat$Discipline == "NO", 2:ncol(dat)], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Discipline != "NO", 2:ncol(dat)], na.rm=TRUE)
+
+barplot(mat, beside=TRUE, main="Average Returns Director Discipline", legend.text = c("NO", "YES"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$Discipline == "NO", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$Discipline != "NO", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median, beside=TRUE, main="Median Returns by Director Discipline", legend.text = c("NO", "YES"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$Discipline == "NO", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$Discipline != "NO", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd, beside=TRUE, main="Standard Deviation of Returns by Director Discipline", legend.text = c("NO", "YES"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by Broker
+dat <- data[, c("Broker", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat[1, ] <- colMeans(dat[dat$Broker == "None", 2:ncol(dat)], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Broker != "None", 2:ncol(dat)], na.rm=TRUE)
+
+barplot(mat, beside=TRUE, main="Average Returns Director No Broker", legend.text = c("None", "Broker"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$Broker == "None", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$Broker != "None", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median, beside=TRUE, main="Median Returns by No Broker", legend.text = c("None", "Broker"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$Broker == "None", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$Broker != "None", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd, beside=TRUE, main="Standard Deviation of Returns by No Broker", legend.text = c("None", "Broker"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+
+#Returns by Offer Options
+dat <- data[, c("Opts_offer_min", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat[1, ] <- colMeans(dat[dat$Opts_offer_min == 0, 2:ncol(dat)], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[dat$Opts_offer_min > 0, 2:ncol(dat)], na.rm=TRUE)
+
+barplot(mat, beside=TRUE, main="Average Returns Offer Options", legend.text = c("None", "Options"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[dat$Opts_offer_min == 0, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[dat$Opts_offer_min > 0, 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median, beside=TRUE, main="Median Returns by Offer Options", legend.text = c("None", "Options"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[dat$Opts_offer_min == 0, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[dat$Opts_offer_min > 0, 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd, beside=TRUE, main="Standard Deviation of Returns by Offer Options", legend.text = c("None", "Options"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+#Returns by CFO
+dat <- data[, c("CFO_A", "rclose", "r1m", "r2m", "r3m", "r4m", "r5m", "r6m", "r7m", "r8m", "r9m", "r10m", "r11m", "r12m")]
+
+mat[1, ] <- colMeans(dat[is.na(dat$CFO_A), 2:ncol(dat)], na.rm=TRUE)
+mat[2, ] <- colMeans(dat[is.na(dat$CFO_A) == "FALSE", 2:ncol(dat)], na.rm=TRUE)
+
+barplot(mat, beside=TRUE, main="Average Returns CFO", legend.text = c("None", "Yes"), bty="n", args.legend = list(x = "bottomleft", bty="n"))
+abline(h=0)
+
+mat.median <- mat
+mat.median[1, 2:ncol(mat.median)] <- apply(dat[is.na(dat$CFO_A), 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+mat.median[2, 2:ncol(mat.median)] <- apply(dat[is.na(dat$CFO_A) == "FALSE", 2:ncol(mat.median)], 2, median, na.rm=TRUE)
+
+barplot(mat.median, beside=TRUE, main="Median Returns by CFO", legend.text = c("None", "Yes"), bty="n", args.legend = list(x = "topleft", bty="n"))
+abline(h=0)
+
+mat.sd <- mat
+mat.sd[1, 2:ncol(mat.sd)] <- (apply(dat[is.na(dat$CFO_A), 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+mat.sd[2, 2:ncol(mat.sd)] <- (apply(dat[is.na(dat$CFO_A) == "FALSE", 2:ncol(mat.sd)], 2, var, na.rm=TRUE))^0.5
+
+barplot(mat.sd, beside = TRUE, main = "Standard Deviation of Returns by CFO", legend.text = c("None", "Options"), bty="n", args.legend = list(x = "topleft", bty = "n"))
+abline(h=0)
+
+
+```
+
+
+
+```{r}
+
+#Autocorrelations
+autocorr <- matrix(nrow=12, ncol=3)
+autocorr[1, 1] <- cor(log(data$Pclose/data$Price), log(data$P1m/data$Pclose), use = "complete.obs")
+autocorr[2, 1] <- cor(log(data$P2m/data$P1m), log(data$P1m/data$Pclose), use = "complete.obs")
+autocorr[3, 1] <- cor(log(data$P3m/data$P2m), log(data$P2m/data$P1m), use = "complete.obs")
+autocorr[4, 1] <- cor(log(data$P4m/data$P3m), log(data$P3m/data$P2m), use = "complete.obs")
+autocorr[5, 1] <- cor(log(data$P5m/data$P4m), log(data$P4m/data$P3m), use = "complete.obs")
+autocorr[6, 1] <- cor(log(data$P6m/data$P5m), log(data$P5m/data$P4m), use = "complete.obs")
+autocorr[7, 1] <- cor(log(data$P7m/data$P6m), log(data$P6m/data$P5m), use = "complete.obs")
+autocorr[8, 1] <- cor(log(data$P8m/data$P7m), log(data$P7m/data$P6m), use = "complete.obs")
+autocorr[9, 1] <- cor(log(data$P9m/data$P8m), log(data$P8m/data$P7m), use = "complete.obs")
+autocorr[10, 1] <- cor(log(data$P10m/data$P9m), log(data$P9m/data$P8m), use = "complete.obs")
+autocorr[11, 1] <- cor(log(data$P11m/data$P10m), log(data$P10m/data$P9m), use = "complete.obs")
+autocorr[12, 1] <- cor(log(data$P12m/data$P11m), log(data$P11m/data$P10m), use = "complete.obs")
+
+autocorr[1, 2] <- nrow(data)-sum(is.na(data$P1m))
+autocorr[2, 2] <- nrow(data)-sum(is.na(data$P2m))
+autocorr[3, 2] <- nrow(data)-sum(is.na(data$P3m))
+autocorr[4, 2] <- nrow(data)-sum(is.na(data$P4m))
+autocorr[5, 2] <- nrow(data)-sum(is.na(data$P5m))
+autocorr[6, 2] <- nrow(data)-sum(is.na(data$P6m))
+autocorr[7, 2] <- nrow(data)-sum(is.na(data$P7m))
+autocorr[8, 2] <- nrow(data)-sum(is.na(data$P8m))
+autocorr[9, 2] <- nrow(data)-sum(is.na(data$P9m))
+autocorr[10, 2] <- nrow(data)-sum(is.na(data$P10m))
+autocorr[11, 2] <- nrow(data)-sum(is.na(data$P11m))
+autocorr[12, 2] <- nrow(data)-sum(is.na(data$P12m))
+
+for (i in 1:12) {
+autocorr[i, 3] <- sqrt((1-autocorr[i,1]^2)/(autocorr[i,2]-2))
+}
+
+plot(autocorr[, 1], type="b", main="Monthly Autocorrelations")
+lines(autocorr[, 3], col="red")
+lines(-autocorr[, 3], col="red")
+abline(h=0)
+
+```
+
+
+
+
+```{r Cross Sectional Autocorrelation of Returns}
+
+#Opening day return
+plot(log(data$Popen/data$Price), log(data$Pclose/data$Popen))
+text(log(data$Popen/data$Price), log(data$Pclose/data$Popen), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(Pclose/Popen)~log(Popen/Price), data), col="red")
+abline(h=0)
+
+#Second day return
+plot(log(data$Pclose/data$Price), log(data$P1day/data$Pclose))
+text(log(data$Pclose/data$Price), log(data$P1day/data$Pclose), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(P1day/Pclose)~log(Pclose/Price), data), col="red")
+abline(h=0)
+
+#Rest of Week Return
+plot(log(data$P1day/data$Price), log(data$P1week/data$P1day))
+text(log(data$P1day/data$Price), log(data$P1week/data$P1day), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(P1week/P1day)~log(P1day/Price), data), col="red")
+abline(h=0)
+
+#Rest of Month Return
+plot(log(data$P1week/data$Price), log(data$P1m/data$P1week))
+text(log(data$P1week/data$Price), log(data$P1m/data$P1week), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(P1m/P1week)~log(P1week/Price), data), col="red")
+abline(h=0)
+
+#3 month Return
+plot(log(data$P1m/data$Price), log(data$P3m/data$P1m)) 
+text(log(data$P1m/data$Price), log(data$P3m/data$P1m), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(P3m/P1m)~log(P1m/Price), data), col="red")
+abline(h=0)
+
+#6 month Returns
+plot(log(data$P3m/data$Price), log(data$P6m/data$P3m)) 
+text(log(data$P3m/data$Price), log(data$P6m/data$P3m), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(P6m/P3m)~log(P3m/Price), data), col="red")
+abline(h=0)
+
+#9 month Returns
+plot(log(data$P6m/data$Price), log(data$P9m/data$P6m))
+text(log(data$P6m/data$Price), log(data$P9m/data$P6m), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(P9m/P6m)~log(P6m/Price), data), col="red")
+abline(h=0)
+
+#12 month returns
+plot(log(data$P9m/data$Price), log(data$P12m/data$P9m))
+text(log(data$P9m/data$Price), log(data$P12m/data$P9m), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(log(P12m/P9m)~log(P9m/Price), data), col="red")
+abline(h=0)
+
+```
+
+
+
+
+```{r Charts}
+charts.fn <- function(r, mu) {
+  
+  data$return <- r
+  
+###Size
+#Returns and Issue Size
+ggplot(data, aes(log(issueSize), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0)
+
+#Returns and Enterprise Value
+ggplot(data, aes(log(1000*ev), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0)
+
+#Returns and Market Cap
+ggplot(data, aes(log(1000*mc), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0)
+
+#Returns and Assets
+ggplot(data, aes(log(Assets), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0)
+
+#Returns and Net Tangible Assets
+ggplot(data, aes(log(NetTangibleAssets + Liab), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0)
+
+#Returns and Revenue
+ggplot(data, aes(log(Sales_A+1), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) + geom_hline(yintercept = 0)
+
+########PROFITS and REVENUE
+#Returns and Asset Turnover
+ggplot(data, aes(Sales_A/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) + geom_vline(xintercept = 0)
+
+#Returns and Gross Profit
+ggplot(data, aes((Sales_A - COGS_A)/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+       
+#Returns & Gross Margin
+ggplot(data, aes(COGS_A/Sales_A, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.05) + geom_hline(yintercept = 0) + geom_vline(xintercept = 0)
+
+#Returns and EBIT/Assets
+ggplot(data, aes(EBIT_A/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and CFO/Assets
+ggplot(data, aes(CFO_A/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and adjusted EBIT/Assets
+ggplot(data, aes(EBIT_A/Assets, return, colour = Sales_A < 10000)) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Forecast Profits
+boxplot(return~I(is.na(PBT_F)), data, main="Forecast Profits")
+abline(h = 0)
+
+#Forecast Profits 
+ggplot(data, aes(EBIT_F/Assets, return, colour = Industry == "SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+###BALANCE SHEET
+#Returns and price to book ratio
+ggplot(data, aes(log((1000*mc*Shares/SharesFD+Liab)/Assets), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Asset growth
+ggplot(data, aes(log(data$Assets/data$A_A), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns & IPO Raising
+ggplot(data, aes(shareRaise, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Gearing
+ggplot(data, aes(Liab/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Cash
+ggplot(data, aes(Cash/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Net Cash
+ggplot(data, aes((Cash - Liab)/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Net Recievables
+ggplot(data, aes((recievables - payables)/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Net Current Assets
+ggplot(data, aes((current.assets - current.liabilities)/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Accumulated Profits
+ggplot(data, aes(accumulated.profits/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) + geom_vline(xintercept = 0) 
+
+####Company
+#Returns and years of operation
+ggplot(data, aes(log(Years_oper), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.035) + geom_hline(yintercept = 0) 
+
+#Returns and R&D
+ggplot(data, aes(RaD_A/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Investment
+ggplot(data, aes(CFI_A/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) + geom_vline(xintercept = 0)
+
+#Returns and Intangibles
+ggplot(data, aes((NetAssets - NetTangibleAssets)/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Industry
+boxplot(return~Industry, data=data, main="Division")
+abline(h = 0)
+
+#Geographic Location
+boxplot(return~I(headOffice), data, main="Australia vs Offshore")
+abline(h = 0)
+
+#Returns and country risk
+ggplot(data, aes(countryRisk, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Market
+boxplot(return~I(Market), data, main="Market") 
+abline(h = 0)
+
+#Returns and Board Independent
+ggplot(data, aes(Independent/Board, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Non-executive directors
+ggplot(data, aes(NED/Board, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Board Director Experience
+ggplot(data, aes(Interlocking/Board, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Board size
+ggplot(data, aes(Board, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Governance departures
+ggplot(data, aes(Departures, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and director Discipline/disciplinary action
+boxplot(data$return~I(data$Discipline!="NO"), main = "Director Discipline")
+abline(h = 0)
+
+#Litigation
+boxplot(data$return~I(data$Litigation!="NO"), main = "Litigation")
+abline(h = 0)
+
+#Returns and dividend policy
+data$Dividend <- as.numeric(ifelse(data$Dividend=="NO", 0, data$Dividend))
+plot(data$Dividend, data$return)
+text(data$Dividend, data$return, labels=data$ASX_Code, cex=0.5, pos=2)
+abline(lm(return~Dividend, data), col="red")
+abline(h = 0)
+
+#Speculative Status
+boxplot(data$return~data$Speculative, main="Speculative")
+abline(h = 0)
+
+#Founder
+boxplot(data$return~data$Founder, main="Founder")
+abline(h = 0)
+
+#Returns and Interlectual Property
+ggplot(data, aes(IP, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and sales target for performance bonus
+ggplot(data, aes(perform.sales/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and profit target for performance bonus
+ggplot(data, aes(perform.profit/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and management option strike price
+ggplot(data, aes(perform.strike/Price - 1, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+###SHAREHOLDING AND OFFER STRUCTURE
+#IPO shareholding/total
+ggplot(data, aes(sIPO, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Management Shareholding
+ggplot(data, aes(sMGT, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Management Options
+ggplot(data, aes(Opts_mgt/SharesFD, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Other Holding
+ggplot(data, aes(1 - sIPO - sMGT - sLM, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Top holders
+ggplot(data, aes(sTOP, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns & Broker share
+ggplot(data, aes(sLM, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Underwriting
+boxplot(return~Underwritten, data=data, main="Underwritten")
+abline(h = 0)
+
+#OMBB
+boxplot(return~OMBB, data=data, main="OMBB")
+abline(h = 0)
+
+#Time Offer Open 
+ggplot(data, aes(timeOpen, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and issue range
+ggplot(data, aes(range, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Options
+ggplot(data, aes(log(SharesFD/Shares), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and IPO Options
+ggplot(data, aes(((Opts_offer_min + Opts_offer_max)/2/SharesFD), return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and escrow
+ggplot(data, aes(escrow, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Costs of Issue
+ggplot(data, aes(cost, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Broker Prestige
+ggplot(data, aes(broker.share, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Auditor Prestige
+ggplot(data, aes(auditor.share, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "loess", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+###OWNERSHIP STRUCTURE
+#Returns and Consideration Shares
+ggplot(data, aes(Shares_consideration/Shares, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and Convertable Shares
+ggplot(data, aes(Shares_convertible/Shares, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+##### USE OF FUNDS
+#Returns and vendor Sales
+ggplot(data, aes(vendorSales/1000/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and asset acquisition
+ggplot(data, aes(assetAcquisition/1000/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and research and development
+ggplot(data, aes(researchDevt/1000/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and investment
+ggplot(data, aes(investment/1000/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and sales & marketing
+ggplot(data, aes(salesMarketing/1000/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and debt repayment
+ggplot(data, aes(debtRepayment/1000/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+#Returns and working capital
+ggplot(data, aes(workingCapital/1000/Assets, return, colour = Industry=="SAAS")) + geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_text(aes(label = ASX_Code), size = 2, nudge_y = 0.025) + geom_hline(yintercept = 0) 
+
+}
+
+```
+
+
+
+
+```{r Predicting Escrow and CFO missing data}
+
+escrow.eq <- lm(Escrow/(Shares-(Offer_min + Offer_max)/2)~I(Type == "RTO") + I(topHolders.s/(Shares - (Offer_min + Offer_max)/2)) + I(Shares_mgt/(Shares-(Offer_min + Offer_max)/2)), data = subset(data, Type != "DOCA"))
+summary(escrow.eq)
+data$escrow.fit <- predict(escrow.eq, data)*(data$Shares - (data$Offer_min + data$Offer_max)/2)/data$Shares
+data$escrow.fit <- ifelse(data$Type == "DOCA", 0, data$escrow.fit)
+
+
+plot(data$escrow.fit, data$escrow)
+text(data$escrow.fit, data$escrow, labels = data$ASX_Code, cex = 0.5, pos = 2 )
+abline(h = 0)
+abline(a = 0, b = 1, col = "red")
+data$escrow <- ifelse(is.na(data$escrow), data$escrow.fit, data$escrow)
+
+cfo.eq <- lm(CFO_A/Assets~I(EBITDA_A/Assets)+I((recievables - payables)/Assets), data)
+summary(cfo.eq)
+data$no.cfo <- ifelse(is.na(data$CFO_A), 1, 0)
+data$cfo.fit <- predict(cfo.eq, data)
+plot(data$cfo.fit, data$CFO_A/data$Assets)
+text(data$cfo.fit, data$CFO_A/data$Assets, labels = data$ASX_Code, cex = 0.5, pos = 2)
+abline(a = 0, b = 1, col = "red")
+data$CFO_A <- ifelse(is.na(data$CFO_A), data$cfo.fit*data$Assets, data$CFO_A)
+data$CFO_A <- ifelse(is.na(data$CFO_A), 0, data$CFO_A)
+
+data$cfi.fit <- mean(data$CFI_A/data$Assets, na.rm=TRUE)*data$Assets
+data$CFI_A <- ifelse(is.na(data$CFI_A), data$cfi.fit, data$CFI_A)
+data0 <- data
+
+```
+
+
+
+
+```{r Additional Data}
+
+data <- data0
+
+#Adjusting initial assets of D20
+data$A_A[data$ASX_Code == "D2O"] <- data$Assets[data$ASX_Code == "D2O"]
+#Filling in blank EBITDA
+data$EBITDA_A <- ifelse(is.na(data$EBITDA_A), 0, data$EBITDA_A)
+
+#Removing Foregin listings with no capital raise
+data <- subset(data, !(ASX_Code %in% c("BFG", "OCA", "NZK", "TGH", "PGL", "PPH")) & Division !="SAAS")
+
+
+#Constructing Data
+data$pb0 <- log(1000*data$mc*data$Shares/data$SharesFD) - log(data$Assets)
+data$pb <- log(1000*data$mcM*data$Shares/data$SharesFD+data$Liab)-log(data$Assets)
+data$pb1w <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P1week/data$Pclose+data$Liab)-log(data$Assets)
+data$pb1m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P1m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb3m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P3m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb6m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P6m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb9m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P9m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb12m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P12m/data$Pclose+data$Liab)-log(data$Assets)
+
+
+#Constructing Data
+data$size <- 1/((data$Assets/1000 + data$mc + data$Liab/1000 + data$ev)/3)
+data$i_assets <- 1/data$Assets
+data$i.mc <- 1/(1000*data$mc + data$Liab)
+data$i.ev <- 1/data$ev
+data$l.years <- log(data$Years_oper)
+data$sales_zero <- ifelse(data$Sales_A == 0, 1, 0)
+data$gp <- (data$Sales_A - data$COGS_A)/data$Assets
+data$no.ebit <- ifelse(data$EBITDA_A == 0, 1, 0)
+data$ebit.neg <- ifelse(data$EBITDA_A <= 0, 1, 0)
+data$sales.assets <- data$Sales_A/data$Assets
+data$r.cfo <- data$CFO_A/data$Assets
+data$r.ebit <- data$EBITDA_A/data$Assets
+data$r.ebit.a <- data$EBITDA_A/data$Assets*(1/data$Assets)
+data$forecasts <- ifelse(is.na(data$EBIT_F)==TRUE, 0, 1)
+data$r.cash <- (data$Cash - data$Liab)/data$Assets
+data$div.zero <- ifelse(data$Dividend == 0, 1, 0)
+data$r.rnd <- data$RaD_A/data$Assets
+data$r_inv <- -data$CFI_A/data$Assets
+data$d_ag <- ifelse(data$Division == "Agriculture Forestry and Fishing", 1, 0)
+data$d_fire <- ifelse(data$Division %in% c("Finance and Insurance Services", "Rental Hiring and Real Estate Services"), 1, 0)
+data$d_trade <- ifelse(data$Division %in% c("Retail Trade", "Wholesale Trade"), 1, 0)
+data$d_services <- ifelse(data$Division %in% c("Professional Scientific and Technical Services", "Administrative and Support Services", "Arts and Recreation Services", "Education and Training", "Healthcare and Social Assitance", "Other Services"), 1, 0)
+data$d_information <- ifelse(data$Division == "Information Media and Telecommunications", 1, 0)
+data$d_man <- ifelse(data$Division == "Manufacturing", 1, 0)
+data$d_SAAS <- ifelse(data$Division == "SAAS", 1, 0)
+data$Australia <- ifelse(data$headOffice == "Australia", 1, 0)
+data$AusMarket <- ifelse(data$Market == "Australia", 1, 0)
+data$specHigh <- ifelse(data$Speculative == "HIGHLY", 1, 0)
+data$spec.low <- ifelse(data$Speculative == "NO", 1, 0)
+data$optsMGT <- data$Opts_mgt/data$SharesFD
+data$sLM.zero <- ifelse(data$sLM == 0, 1, 0)
+data$r.int <- (data$NetAssets - data$NetTangibleAssets)/data$Assets
+data$d.Underwritten <- ifelse(data$Underwritten == "YES", 1, 0)
+data$d_OMBB <- ifelse(data$OMBB == "YES", 1, 0)
+data$offerRange <- log(data$Offer_max/data$Offer_min) 
+data$timeOpen <- ifelse(data$timeOpen > 40, 1, 0)
+data$r_options <- log((data$SharesFD -(data$Opts_offer_min + data$Opts_offer_max)/2)/data$Shares)
+data$sLM <- (data$Opts_broker + data$Shares_broker)/data$SharesFD   
+data$offerOpts <- ifelse(data$Opts_offer_min > 0, 1, 0)
+
+data$r.consideration <- data$Shares_consideration/data$Shares  
+data$r.convertible <- data$Shares_convertible/data$Shares
+data$r.vendor.sales <- data$vendorSales/1000/data$Assets
+data$r.asset.acq <- data$assetAcquisition/1000/data$Assets
+data$r.research <- data$researchDevt/1000/data$Assets
+data$r_investment <- data$investment/1000/data$Assets                 
+data$r.marketing <- data$salesMarketing/1000/data$Assets
+data$r.working.cap <- data$workingCapital/1000/data$Assets
+data$no.broker <- ifelse(data$Broker == "None", 1, 0)
+data$l.pb <- log(1000*data$mc*data$Shares/data$SharesFD + data$Liab)- log(data$Assets)
+data$sales_target <- data$perform.sales/data$Assets
+#data$sales_target <- ifelse(data$perform.sales > 0, 1, 0)
+#data$profit.target <- data$perform.profit/data$Assets
+data$profit.target <- ifelse(data$perform.profit > 0, 1, 0)
+data$price.target <- ifelse(data$perform.strike > 0, 1, 0)
+#data$price.target <- data$perform.strike/data$Price - 1
+data$Discipline <- ifelse(data$Discipline == "NO", 0, 1)
+data$independent <- data$Independent/data$Board
+data$experience <- data$Interlocking/data$Board
+data$r.current <- (data$current.assets - data$current.liabilities)/data$Assets
+data$r.recievables <- (data$recievables - data$payables)/data$Assets
+data$r.ebit.cfo <- (data$EBIT_A/2 + data$CFO_A/2)/data$Assets
+
+#write.csv(data, file="Indust.csv")
+             
+x <- data[, c("i_assets", 
+              "size",
+               "i.mc",
+              "gp",
+              "i.ev",
+              "l.years", 
+              "sales_zero", 
+              "ebit.neg", 
+              "no.ebit",
+              "no.cfo",
+              "sales.assets", 
+              "r.cfo",
+              "r.ebit",
+              "r.ebit.a",
+              "r.ebit.cfo",
+              "forecasts", 
+              "r.cash", 
+              "shareRaise",
+              "div.zero", 
+              "Dividend", 
+              "r.rnd", 
+              "r_inv",
+              "d_ag",
+              "d_fire",
+              "d_trade",
+              "d_services",
+              "d_information",
+              "d_man",
+       #       "d_SAAS",
+              "Australia", 
+              "AusMarket",
+              "countryRisk", 
+              "specHigh", 
+              "spec.low", 
+              "IP",
+              "sIPO", 
+              "sMGT", 
+              "optsMGT",
+              "sTOP",
+              "sLM", 
+              "sLM.zero",
+              "escrow", 
+              "r.int", 
+              "d.Underwritten", 
+              "d_OMBB", 
+              "offerRange", 
+              "timeOpen",
+              "r_options", 
+              "offerOpts",
+              "broker.share", 
+              "auditor.share", 
+              "no.broker", 
+              "cost", 
+              "r.consideration", 
+              "r.convertible",
+              "r.vendor.sales", 
+              "r.asset.acq", 
+              "r.research", 
+              "r_investment", 
+              "r.marketing", 
+              "r.working.cap", 
+              "r.current", 
+              "r.recievables",
+              "sales_target",
+              "profit.target", 
+              "price.target",
+              "independent",
+              "experience",
+              "l.pb")]
+
+cor.ret <- matrix(NA, nrow = ncol(x), ncol = 8)
+rownames(cor.ret) <- colnames(x)
+colnames(cor.ret) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m", "avg")
+cor.level <- cor.ret
+
+cor.ret[, 1] <- t(cor(data$rclose, x, use = "complete.obs"))  
+cor.ret[, 2] <- t(cor(data$r1w, x, use = "complete.obs"))
+cor.ret[, 3] <- t(cor(data$r1m, x, use = "complete.obs"))
+cor.ret[, 4] <- t(cor(data$r3m, x, use = "complete.obs"))
+cor.ret[, 5] <- t(cor(data$r6m, x, use = "complete.obs"))
+cor.ret[, 6] <- t(cor(data$r9m, x, use = "complete.obs"))
+cor.ret[, 7] <- t(cor(data$r12m, x, use = "complete.obs"))
+cor.ret[, 8] <- rowMeans(cor.ret[, 1:7])
+
+cor.ret <- cor.ret[sort.list(-abs(cor.ret[, 8])), ] 
+  
+cor.level[, 1] <- t(cor(data$pb, x, use = "complete.obs"))  
+cor.level[, 2] <- t(cor(data$pb1w, x, use = "complete.obs"))
+cor.level[, 3] <- t(cor(data$pb1m, x, use = "complete.obs"))
+cor.level[, 4] <- t(cor(data$pb3m, x, use = "complete.obs"))
+cor.level[, 5] <- t(cor(data$pb6m, x, use = "complete.obs"))
+cor.level[, 6] <- t(cor(data$pb9m, x, use = "complete.obs"))
+cor.level[, 7] <- t(cor(data$pb12m, x, use = "complete.obs"))
+cor.level[, 8] <- rowMeans(cor.level[, 1:7])
+
+cor.level <- cor.level[sort.list(-abs(cor.level[, 8])), ] 
+  
+```
+
+
+
+```{r Training with cross validation - data, functions and tables}
+
+#Output table
+rSquared <- matrix(NA, nrow = 55, ncol = 8)
+colnames(rSquared) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m", "Avg")
+rownames(rSquared) <- c("KNNk", "RFmtree", "ENalpha", "ENlambda", "M5pruned", "M5smooth", "M5rules", "SVMsigma", "SVMc", "NNsize", "NNdecay", "rSquared", "KNN", "LIN", "AIC", "BIC", "EN", "RF", "M5", "SVM", "NN", "AVG", "DM", "KNN", "LIN", "AIC", "BIC", "EN", "RF", "M5", "SVM", "NN", "AVG", ">20", "KNN", "LIN", "AIC", "BIC", "EN", "RF", "M5", "SVM", "NN", "AVG", "RMSE", "KNN", "LIN", "AIC", "BIC", "EN", "RF", "M5", "SVM", "NN", "AVG")
+
+rSquaredCV <- matrix(NA, nrow = 20, ncol = 8)
+colnames(rSquaredCV) <- colnames(rSquared)
+rownames(rSquaredCV) <- c("R2", "KNN", "LIN", "AIC", "BIC", "EN", "RF", "M5", "SVM", "NN", "RMSE", "KNN", "LIN", "AIC", "BIC", "EN", "RF", "M5", "SVM", "NN")
+
+#plotting function
+plot.fn <- function(type){
+  plot(predictions, test.data$return, main = paste0(c(name), "", type))
+  text(predictions, test.data$return, labels = test.labels, cex = 0.5, pos = 2)
+  abline(h = 0)
+  abline(a = 0, b = 1, col = "red")
+  abline(lm(test.data$return ~ predictions))
+}
+
+# Writing out of sample fit data to file
+write.fn <- function(n1, n2, n3, n4){
+    rSquared[n1, i] <- 1 - sum((test.data$return - predictions)^2, na.rm = TRUE)/sum((test.data$return - mean(train.data$return, na.rm = TRUE))^2, na.rm = TRUE)
+  rSquared[n2, i] <- dm.test(na.exclude(test.data$return - predictions), na.exclude(test.data$return) - mean(train.data$return, na.rm = TRUE), alternative = c("two.sided"), h = 1, power=2)$p.value[1]
+    test.data$predictions <- predictions
+    rSquared[n3, i] <- mean(test.data$return[test.data$predictions > 0.2], na.rm = TRUE)
+    rSquared[n4, i] <- RMSE(predictions, test.data$return, na.rm = TRUE)
+    rSquared
+}
+
+
+#Dependent variable
+y <- subset(data, select = c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m"))
+x <- data[, c("size",
+              "sales_target",
+              "d_man",
+    #          "d_SAAS",
+              "d_fire",
+              "sales_zero",
+              "sales.assets",
+              "r.cash",
+              "no.broker",
+              "d_OMBB",
+              "timeOpen",
+              "sTOP",
+              "sMGT",
+              "sIPO",
+              "r.ebit",
+              "r.ebit.a",
+              "r.cfo",
+   #           "optsMGT",
+              "Australia",
+              "r_options",
+              "offerOpts",
+              "countryRisk",
+              "independent",
+              "ebit.neg",
+   #           "offerRange",
+   #           "escrow",
+              "l.pb")]
+
+# Split the data into training and test set
+smp_siz <- floor(0.75*nrow(x))
+set.seed(8)   
+train_ind <- sample(seq_len(nrow(x)),size = smp_siz) 
+train.data <- x[train_ind, ] 
+test.data <- x[-train_ind, ] 
+train.y <- y[train_ind, ]
+test.y <- y[-train_ind, ]
+train.labels <- data$ASX_Code[train_ind]
+test.labels <- data$ASX_Code[-train_ind]
+
+#fitted values
+fits <- as.data.frame(matrix(NA, nrow = nrow(test.data), ncol = 9*7))
+fitsCV <- as.data.frame(matrix(NA, nrow = nrow(train.data), ncol = (9+1)*7))
+j <- 0
+
+```
+
+
+
+```{r Feature selection}
+
+x <- train.data[, !(names(train.data) %in% c("offerOpts", "no.broker"))]
+#x <- train.data
+
+#optVars <- matrix(NA, nrow = ncol(x), ncol = 7)
+#colnames(optVars) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+#optStats <- matrix(NA, nrow = ncol(x), ncol = 9)
+#colnames(optStats) <- c(colnames(optVars), "AVG", "Median")
+
+x <- cbind(train.y[, 1], x)
+
+smp_size <- floor(0.75 * nrow(x))
+set.seed(8)
+train_ind <- sample(seq_len(nrow(x)), size = smp_size)
+
+subsets <- c(1:(ncol(x)-1))
+
+for (i in 6:7){
+  
+x[, 1] <- train.y[1:nrow(x), i]
+
+train <- x[train_ind, ]
+test <- x[-train_ind, ]
+train <- na.omit(train)
+test <- na.omit(test)
+
+set.seed(8)
+
+ctrl <- rfeControl(functions = caretFuncs,
+                   method = "cv",
+                   verbose = FALSE)
+
+svmProfile <- rfeIter(train[, 2:ncol(x)], train[, 1],
+                  test[, 2:ncol(x)], test[, 1],
+                 sizes = subsets,
+           #      method = "knn",
+           #       method = "M5",
+           #      method = "svmRadial",
+                 method = "nnet",
+                 maxit = 1000,
+                 preProcess = c("center","scale"),
+                 rfeControl = ctrl)
+
+svmProfile$pred$error <- (svmProfile$pred$obs - svmProfile$pred$pred)^2
+svmProfileRMSE <- aggregate(svmProfile$pred$error, by = list(svmProfile$pred$Variables), FUN = "mean")
+svmProfileRMSE$rmse <- svmProfileRMSE$x^0.5
+
+plot(svmProfileRMSE$rmse, main = colnames(train.y[i]), xlab = "")
+optStats[1:nrow(svmProfileRMSE), i] <- svmProfileRMSE$rmse
+
+k <- which(svmProfileRMSE$rmse == min(svmProfileRMSE$rmse))
+n <- ncol(x) - k 
+svmProfile$finalVariables[[n]]
+
+#optVars[1:length(svmProfile$optVariables), i] <- svmProfile$optVariables
+optVars[1:k, i] <- rownames(svmProfile$finalVariables[[n]])
+
+}
+
+optStats[, 8] <- rowMeans(optStats[, 1:7], na.rm = TRUE)
+optStats[, 9] <- rowMedians(optStats[, 1:7], na.rm = TRUE)
+
+plot(optStats[, 8], ylim = c(min(optStats[, 9]),max(optStats[, 8])))
+lines(optStats[, 9], col = "red")
+
+variables <- as.data.frame(table(optVars))
+variables[order(variables$Freq, decreasing = TRUE), ]
+
+```
+
+
+
+
+
+
+```{r Cross Validation Results}
+set.seed(8)
+ctrl <- trainControl("cv", number = 10, savePredictions = "final")
+
+
+for (i in 1:7) {
+j <- j + 1
+# Fit the model on the training set
+set.seed(8)
+
+    if(i == 1){
+      train.data <- cbind(train.y[, 1], train.data) 
+      test.data <- cbind(test.y[, 1], test.data)
+    } else {
+      train.data[, 1] <- train.y[, i]
+      test.data[, 1] <- test.y[, i]
+    }
+
+name <- colnames(train.y)[i]
+colnames(train.data)[1] <- "return"
+colnames(test.data)[1] <- "return"
+
+#KNN Model
+set.seed(8)
+knn.mod <- train(return ~
+        d_man
+       + r.cash
+       + r.cfo
+       + r.ebit
+       + r.ebit.a
+       + sIPO
+       + size
+       + sTOP
+       + l.pb
+       + no.broker
+       + r_options
+       + sales.assets
+       + sales_target, 
+  data = train.data, 
+  method = "knn",
+  trControl = ctrl,
+  preProcess = c("center","scale"),
+  tuneLength = 10,
+  na.action = na.omit)
+
+# Plot model error RMSE vs different values of k
+plot(knn.mod)
+# Best tuning parameter k that minimize the RMSE
+knn.mod$bestTune
+# Make predictions on the test data
+predictions <- knn.mod %>% predict(test.data)
+plot.fn("KNN")
+rSquared[1, i] <- knn.mod$bestTune[1, 1]
+rSquared <- write.fn(13, 24, 35, 46)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- knn.mod$pred[order(knn.mod$pred$rowIndex), "obs"]
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j + 1] <- knn.mod$pred[order(knn.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("KNN", name)
+colnames(fitsCV)[j] <- name
+colnames(fitsCV)[j + 1] <- paste0("KNN", name)
+j <- j + 2
+
+#Linear Model
+set.seed(8)
+lin.mod <- train(return ~ ., 
+         data = train.data, 
+         method = "lm",
+         trControl = ctrl,
+         na.action = na.omit)
+# Make predictions on the test data
+predictions <- lin.mod %>% predict(test.data)
+plot.fn("LIN")
+rSquared <- write.fn(14, 25, 36, 47)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- lin.mod$pred[order(lin.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("LIN", name)
+colnames(fitsCV)[j] <- paste0("LIN", name)
+j <- j + 1
+
+#AIC Linear Model
+set.seed(8)
+shuffleData <- train.data
+shuffleData <- shuffleData[is.na(shuffleData$return) == "FALSE", ]
+#Create 10 equally size folds
+folds <- cut(seq(1, nrow(shuffleData)), breaks = 10, labels = FALSE)
+shuffleData$pred <- rep(0, nrow(shuffleData))
+for(k in 1:10){
+    testIndexes <- which(folds == k, arr.ind = TRUE)
+    test <- shuffleData[testIndexes, ]
+    train <- shuffleData[-testIndexes, ]
+    lin.mod.aic <- step(lm(return ~ .-pred, 
+                           data = train,
+                           scope = list(lower = ~ 1, upper = ~ .-pred), 
+                           direction = "both"))
+    pred <- predict(lin.mod.aic, test)
+    shuffleData$pred[testIndexes] <- pred
+}
+shuffleData$rowIndex <- as.numeric(rownames(shuffleData))
+lin.mod.aic <- step(lm(return ~ ., 
+                           data = train.data,
+                           scope = list(lower = ~ 1, upper = ~ .), 
+                           direction = "both"))
+# Make predictions on the test data
+predictions <- lin.mod.aic %>% predict(test.data)
+plot.fn("AIC")
+rSquared <- write.fn(15, 26, 37, 48)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- shuffleData$pred
+colnames(fits)[j] <- paste0("AIC", name)
+colnames(fitsCV)[j] <- paste0("AIC", name)
+j <- j + 1
+
+
+#BIC Linear Model
+set.seed(8)
+shuffleData <- train.data
+shuffleData <- shuffleData[is.na(shuffleData$return) == "FALSE", ]
+#Create 10 equally size folds
+folds <- cut(seq(1, nrow(shuffleData)), breaks = 10, labels = FALSE)
+shuffleData$pred <- rep(0, nrow(shuffleData))
+for(k in 1:10){
+    testIndexes <- which(folds == k, arr.ind = TRUE)
+    test <- shuffleData[testIndexes, ]
+    train <- shuffleData[-testIndexes, ]
+    lin.mod.bic <- step(lm(return ~ .-pred, 
+                           data = train,
+                           scope = list(lower = ~ 1, upper = ~ .-pred), 
+                           direction = "both",
+                           k = log(n)))
+    pred <- predict(lin.mod.aic, test)
+    shuffleData$pred[testIndexes] <- pred
+}
+shuffleData$rowIndex <- as.numeric(rownames(shuffleData))
+lin.mod.bic <- step(lm(return ~ ., 
+                           data = train.data,
+                           scope = list(lower = ~ 1, upper = ~ .), 
+                           direction = "both",
+                           k = log(n)))
+# Make predictions on the test data
+predictions <- lin.mod.bic %>% predict(test.data)
+plot.fn("BIC")
+rSquared <- write.fn(16, 27, 38, 49)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- shuffleData$pred
+colnames(fits)[j] <- paste0("BIC", name)
+colnames(fitsCV)[j] <- paste0("BIC", name)
+j <- j + 1
+
+
+#Elastic Net model
+set.seed(8)
+en.mod <- train(return ~ ., 
+        data = train.data,
+        method = "glmnet",
+        trControl = ctrl,
+        preProcess = c("center","scale"),
+        tuneLength = 10,
+        na.action = na.omit)
+predictions <- en.mod %>% predict(test.data)
+plot.fn("EN")
+rSquared[3, i] <- en.mod$bestTune[1, 1]
+rSquared[4, i] <- en.mod$bestTune[1, 2]
+rSquared <- write.fn(17, 28, 39, 50)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- en.mod$pred[order(en.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("EN", name)
+colnames(fitsCV)[j] <- paste0("EN", name)
+j <- j + 1
+
+#Random Forest Model
+set.seed(8)
+rf.mod <- train(return ~ ., 
+  data = train.data, 
+  method = "rf",
+  trControl = ctrl,
+  preProcess = c("center","scale"),
+  tuneLength = 10,
+  na.action = na.omit
+  )
+
+plot(rf.mod)
+rSquared[2, i] <- rf.mod$bestTune[1, 1]
+predictions <- rf.mod %>% predict(test.data)
+plot.fn("RF")
+rSquared <- write.fn(18, 29, 40, 51)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- rf.mod$pred[order(rf.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("RF", name)
+colnames(fitsCV)[j] <- paste0("RF", name)
+j <- j + 1
+
+#M5 Model
+set.seed(8)
+M5.mod <- train(return ~
+                  size
+                + r.ebit
+                + r.cfo
+                + r.ebit.a
+                + no.broker
+                + sales_target
+                + sTOP, 
+  data = train.data, 
+  method = "M5",
+  trControl = ctrl,
+  preProcess = c("center","scale"),
+  tuneLength = 10,
+  na.action = na.omit
+  )
+
+M5.mod
+rSquared[5, i] <- M5.mod$bestTune[1, 1]
+rSquared[6, i] <- M5.mod$bestTune[1, 2]
+rSquared[7, i] <- M5.mod$bestTune[1, 3]
+predictions <- M5.mod %>% predict(test.data)
+plot.fn("M5P")
+rSquared <- write.fn(19, 30, 41, 52)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- M5.mod$pred[order(M5.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("M5", name)
+colnames(fitsCV)[j] <- paste0("M5", name)
+j <- j + 1
+
+#Support Vector Machine Model
+set.seed(8)
+SVM.mod <- train(return 
+                 ~ size
+                 + sTOP
+                 + r.ebit
+                 + r.ebit.a
+                 + r_options
+                 + d_fire
+                 + sales_target
+                 + r.cash
+                 + d_man
+                 + sIPO
+                 + sales.assets
+                 + r.cfo
+                 + no.broker
+                 + sIPO
+                 + l.pb, 
+  data = train.data, 
+  method = "svmRadial",
+  trControl = ctrl,
+  preProcess = c("center","scale"),
+  tuneLength = 10,
+  na.action = na.omit
+  )
+
+rSquared[8, i] <- SVM.mod$bestTune[1, 1]
+rSquared[9, i] <- SVM.mod$bestTune[1, 2]
+predictions <- SVM.mod %>% predict(test.data)
+plot.fn("SVM")
+rSquared <- write.fn(20, 31, 42, 53)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- SVM.mod$pred[order(SVM.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("SVM", name)
+colnames(fitsCV)[j] <- paste0("SVM", name)
+j <- j + 1
+
+#Neural Network
+set.seed(8)
+NN.mod <- train(return ~ 
+                  size
+                + d_man
+                + sales_target
+                + sales_zero
+                + sTOP
+                + Australia
+                + r_options
+                + sIPO, 
+    data = train.data, 
+    na.action = na.omit,
+    method = "nnet", 
+    trControl = ctrl,
+    maxit = 1000, 
+    trace = F, 
+    linout = 1, 
+    preProcess = c("center", "scale"))
+predictions <- NN.mod %>% predict(test.data)
+rSquared[10, i] <- NN.mod$bestTune[1, 1]
+rSquared[11, i] <- NN.mod$bestTune[1, 2]
+plot.fn("NN")
+rSquared <- write.fn(21, 32, 43, 54)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- NN.mod$pred[order(NN.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("NN", name)
+colnames(fitsCV)[j] <- paste0("NN", name)
+
+#CV Fit values
+error <- fitsCV[, (2 + (i-1)*10):(i*10)] - fitsCV[, (1 + (i-1)*10)]
+rSquaredCV[2:10, i] <- 1 - apply(error, 2, var, na.rm = TRUE)/var(fitsCV[, (1 + (i-1)*10)], na.rm = TRUE)
+rSquaredCV[12:20, i] <- apply(error, 2, var, na.rm = TRUE)^0.5
+ 
+}
+
+#Checking for optimal weighting using CV Data
+fcstComb <- matrix(NA, nrow = 20, ncol = 8)
+colnames(fcstComb) <- colnames(rSquared)
+rownames(fcstComb) <- c("RMSE_Train", "SA", "Med", "TA", "NG", "BG", "InvW", "OLS", "LAD", "CLS", "RMSE_Test", "SA", "MED", "TA", "NG", "BG", "InvW", "OLS", "LAD", "CLS")
+wCLS <- matrix(NA, nrow = 9, ncol = 8)
+colnames(wCLS) <- colnames(rSquared)
+rownames(wCLS) <- c("KNN", "LIN", "AIC", "BIC", "EN", "RF", "M5", "SVM", "NN")
+
+for (k in 1:7){
+
+train_o <- (fitsCV[1:(nrow(fitsCV) - sum(is.na(fitsCV[1+(k-1)*10]))), (1 + (k - 1)*10)])
+train_p <- as.matrix(fitsCV[1:(nrow(fitsCV) - sum(is.na(fitsCV[1+(k-1)*10]))), (2 + (k - 1)*10):(10 + (k - 1)*10)])
+
+test_o <- test.y[1:(nrow(test.y) - sum(is.na(test.y[k]))), k]
+test_p <- as.matrix(fits[1:(nrow(test.y) - sum(is.na(test.y[k]))), (1 + 9*(k-1)):(9*k)])
+
+input_data <- foreccomb(train_o, train_p, test_o, test_p)
+
+modelSA <- comb_SA(input_data)
+modelMED <- comb_MED(input_data)
+modelTA <- comb_TA(input_data, trim_factor = 0.5)
+modelNG <- comb_NG(input_data)
+modelBG <- comb_BG(input_data)
+modelInvW <- comb_InvW(input_data)
+modelOLS <- comb_OLS(input_data)
+modelLAD <- comb_LAD(input_data)
+modelCLS <- comb_CLS(input_data)
+#Weights for CLS
+wCLS[, k] <- modelCLS$Weights
+#RMSE Training Data
+fcstComb[2, k] <- modelSA$Accuracy_Train[2]
+fcstComb[3, k] <- modelMED$Accuracy_Train[2]
+fcstComb[4, k] <- modelTA$Accuracy_Train[2]
+fcstComb[5, k] <- modelNG$Accuracy_Train[2]
+fcstComb[6, k] <- modelBG$Accuracy_Train[2]
+fcstComb[7, k] <- modelInvW$Accuracy_Train[2]
+fcstComb[8, k] <- modelOLS$Accuracy_Train[2]
+fcstComb[9, k] <- modelLAD$Accuracy_Train[2]
+fcstComb[10, k] <- modelCLS$Accuracy_Train[2]
+#RMSE Test Data
+fcstComb[12, k] <- modelSA$Accuracy_Test[2]
+fcstComb[13, k] <- modelMED$Accuracy_Test[2]
+fcstComb[14, k] <- modelTA$Accuracy_Test[2]
+fcstComb[15, k] <- modelNG$Accuracy_Test[2]
+fcstComb[16, k] <- modelBG$Accuracy_Test[2]
+fcstComb[17, k] <- modelInvW$Accuracy_Test[2]
+fcstComb[18, k] <- modelOLS$Accuracy_Test[2]
+fcstComb[19, k] <- modelLAD$Accuracy_Test[2]
+fcstComb[20, k] <- modelCLS$Accuracy_Test[2]
+
+}
+
+fcstComb[, ncol(fcstComb)] <- rowMeans(fcstComb[, 1:(ncol(fcstComb) - 1)])
+barplot(rbind(fcstComb[2:10, 8], fcstComb[12:20, 8]), beside = TRUE)
+
+wCLS[, ncol(wCLS)] <- rowMeans(wCLS[, 1:(ncol(wCLS) - 1)])
+barplot(wCLS[, ncol(wCLS)])
+
+#Weights for KNN, LIN, AIC, BIC, EN, RF, M5, SVM, NN
+fits <- subset(fits, select = -c(V2, V12, V22, V32, V42, V52, V62))
+weights <- c(0.2, 0, 0, 0.8, 0, 0, 0, 0, 0)
+AVG <- data.frame(matrix(NA, nrow = nrow(fits), ncol = 7))
+colnames(AVG) <- colnames(rSquared[, 1:7])
+AVG[, 1] <- as.matrix(fits[, 1:9])%*%as.matrix(weights)
+AVG[, 2] <- as.matrix(fits[, 10:18])%*%as.matrix(weights)
+AVG[, 3] <- as.matrix(fits[, 19:27])%*%as.matrix(weights)
+AVG[, 4] <- as.matrix(fits[, 28:36])%*%as.matrix(weights)
+AVG[, 5] <- as.matrix(fits[, 37:45])%*%as.matrix(weights)
+AVG[, 6] <- as.matrix(fits[, 46:54])%*%as.matrix(weights)
+AVG[, 7] <- as.matrix(fits[, 55:63])%*%as.matrix(weights)
+
+testError <- test.y - AVG
+rSquared[22, 1:7] <- 1 - colSums(testError^2, na.rm = TRUE)/colSums(test.y^2, na.rm = TRUE)
+rSquared[55, 1:7] <- (colMeans(testError^2, na.rm = TRUE))^0.5
+rSquared[44, 1:7] <- colMeans(ifelse(AVG > 0.2, 1, NA)*test.y, na.rm = TRUE)
+
+for (k in 1:7){
+  rSquared[31, k] <- dm.test(na.exclude(AVG[, k] - test.y[, k]), na.exclude(test.y[, k] - mean(train.y[, k], na.rm = TRUE)), alternative = c("two.sided"), h = 1, power = 2)$p.value[1]
+}
+ 
+rSquared[, ncol(rSquared)] <- rowMeans(rSquared[, 1:(ncol(rSquared)-1)])
+rSquaredCV[, ncol(rSquaredCV)] <- rowMeans(rSquaredCV[, 1:(ncol(rSquaredCV)-1)])
+
+barplot(rSquared[13:22, 1:8], beside = TRUE, main = "Out of Sample r2")
+barplot(rSquared[35:44, 1:8], beside = TRUE, main = "Out of Sample Return")
+abline(h = 0.2)
+barplot(rSquared[46:55, 1:8], beside = TRUE, main = "Out of Sample RMSE")
+
+barplot(rSquaredCV[2:10, 1:8], beside = TRUE, main = "CV Rsquared")
+barplot(rSquaredCV[12:20, 1:8], beside = TRUE, main = "CV RMSE")
+
+```
+
+
+
+
+
+```{r Full Sample Equation}
+
+#Market Cap Size
+plot(log(data$mc), log(data$mcM))
+abline(a=0, b=1)
+text(log(data$mc), log(data$mcM), labels=data$ASX_Code, cex=0.5, pos=2)
+
+#NetTangibleAssets
+plot(log(data$NetTangibleAssets+data$Liab), log(1000*data$mcM+data$Liab))
+text(log(data$NetTangibleAssets+data$Liab), log(1000*data$mcM + data$Liab), labels=data$ASX_Code, cex=0.5, pos=2)
+abline(a=mean(log((1000*data$mcM+data$Liab)/(data$NetTangibleAssets+data$Liab)), na.rm=TRUE), 1, col="red")
+
+
+#Closing Price Returns
+#charts.fn(data$rclose, mean(data$rclose, na.rm=TRUE))
+#charts.fn(data$r6m, mean(data$r6m, na.rm=TRUE))
+#charts.fn(data$r12m, mean(data$r12m, na.rm=TRUE))
+#charts.fn(data$r12m - data$rclose, mean(data$r12m-data$rclose, na.rm=TRUE))
+
+
+x <- data[, c("i_assets_mc",
+#              "l.years",
+              "sales_zero",
+              "ebit.neg",
+              "r_ebit_cfo_a",
+              "r.cfo.a",
+              "r_inv",
+              "sales.assets",
+#              "r.cash",
+#              "r.current",
+              "sIPO",
+              "sMGT",
+              "sTOP",
+#              "sLM",
+#              "cost",
+#              "r_options",
+              "escrow",
+              "no.broker",
+              "d_man",
+              "d_fire",
+              "d.services",
+              "countryRisk",
+              "Australia",
+#              "shareRaise",
+#              "r.consideration", 
+#              "r.convertible",
+              "r.vendor.sales", 
+              "Dividend",
+              "sales_target",
+              "l.pb")]
+              
+
+#Saving coefficients
+tbl.lambda <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda) <- names
+
+#Chart function
+chart.fit <- function(fit, actual, se, title) {  
+plot(fit, actual, main = title)
+text(fit, actual, labels = data$ASX_Code, cex=0.5, pos=2)
+abline(a = 0, b = 1)
+abline(a =-se, b=1, col="red")
+abline(a = se, b=1, col="red")
+abline(h = 0) }
+
+#Estimation function
+estimate.fn <- function(){
+  cv.out <- cv.glmnet(as.matrix(x[1:(length(y)-sum(is.na(y))), ]), as.matrix(y[1:(length(y)-sum(is.na(y)))]), standardize = TRUE, alpha = 0.5, keep=TRUE)
+}
+
+#Saving coefficients and goodness of fit statistics
+save.fn <- function(i, fit, fit.cv, tbl){
+  tbl[1:(dim(coef(cv.out))[1]), i] <- coef(cv.out, s = cv.out$lambda.min)[, 1]
+  tbl[(nrow(tbl)-3), i] <- 1-sum((y-fit)^2, na.rm=TRUE)/sum((y-mean(y, na.rm=TRUE))^2, na.rm=TRUE)
+  tbl[(nrow(tbl)-2), i] <- 1-sum((y-fit.cv)^2, na.rm=TRUE)/sum((y-mean(y, na.rm=TRUE))^2, na.rm=TRUE)
+  tbl[(nrow(tbl)-1), i] <- var(y - fit.cv, na.rm=TRUE)^0.5
+  tbl[nrow(tbl), i] <- (var(y, na.rm=TRUE))^0.5
+  tbl
+  }
+
+####Closing Price
+y <- data$rclose
+cv.out <- estimate.fn()
+
+#cross validated predictions
+data$rclose.cv <- NA
+data$rclose.cv[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+data$rclose.fit <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(data$rclose.fit, data$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#measures of fit
+tbl.lambda <- save.fn(1, data$rclose.fit, data$rclose.cv, tbl.lambda)
+
+
+
+####1 Week Return
+y <- data$r1w
+cv.out <- estimate.fn()
+
+#cross validated predictions
+data$r1w.cv <- NA
+data$r1w.cv[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+data$r1w.fit <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(data$r1w.fit, data$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#measures of fit
+tbl.lambda <- save.fn(2, data$r1w.fit, data$r1w.cv, tbl.lambda)
+
+
+
+
+####1 Month Return
+y <- data$r1m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+data$r1m.cv <- NA
+data$r1m.cv[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+data$r1m.fit <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(data$r1m.fit, data$r1m, min(cv.out$cvm)^0.5, "r1m")
+
+#measures of fit
+tbl.lambda <- save.fn(3, data$r1m.fit, data$r1m.cv, tbl.lambda)
+
+
+
+####3 Month Return
+y <- data$r3m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+data$r3m.cv <- NA
+data$r3m.cv[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+data$r3m.fit <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(data$r3m.fit, data$r3m, min(cv.out$cvm)^0.5, "r3m")
+
+#measures of fit
+tbl.lambda <- save.fn(4, data$r3m.fit, data$r3m.cv, tbl.lambda)
+
+
+
+####6 Month Return
+y <- data$r6m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+data$r6m.cv <- NA
+data$r6m.cv[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+data$r6m.fit <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(data$r6m.fit, data$r6m, min(cv.out$cvm)^0.5, "r6m")
+
+#measures of fit
+tbl.lambda <- save.fn(5, data$r6m.fit, data$r6m.cv, tbl.lambda)
+
+
+####9 Month Return
+y <- data$r9m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+data$r9m.cv <- NA
+data$r9m.cv[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+data$r9m.fit <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(data$r9m.fit, data$r9m, min(cv.out$cvm)^0.5, "r9m")
+
+#measures of fit
+tbl.lambda <- save.fn(6, data$r9m.fit, data$r9m.cv, tbl.lambda)
+
+
+####12 Month Return
+y <- data$r12m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+data$r12m.cv <- NA
+data$r12m.cv[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+data$r12m.fit <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(data$r12m.fit, data$r12m, min(cv.out$cvm)^0.5, "r12m")
+
+#measures of fit
+tbl.lambda <- save.fn(7, data$r12m.fit, data$r12m.cv, tbl.lambda)
+
+data[(nrow(data)-13):nrow(data), c("ASX_Code", "rclose.fit", "r1w.fit", "r1m.fit", "r3m.fit", "r6m.fit", "r9m.fit", "r12m.fit")]
+
+```
+
+
+
+```{r Out of sample fits}
+
+table.rmse <- matrix(NA, nrow = 7, ncol = 12)
+rownames(table.rmse) <- c("Baseline", "Lin.reg", "AIC", "BIC", "Tree", "Tree.p", "RF")
+vec.rmse <- matrix(NA, nrow = 7, ncol = 1)
+
+data$return <- data$rclose
+
+data.rf <- data[1:(nrow(data)-sum(is.na(data$return))), c("return", 
+                                                          "i_assets_mc", 
+                                                          "sales_target", 
+                                                          "d_man", 
+                                                          "d_fire", 
+                                                          "sales_zero", 
+                                                          "ebit.neg", 
+                                                          "r_inv", 
+                                                          "no.broker", 
+                                                          "sTOP", 
+                                                          "sMGT", 
+                                                          "sIPO", 
+                                                          "r_ebit_cfo_a",
+                                                          "d_OMBB", 
+                                                          "countryRisk", 
+                                                          "Australia",
+                                                          "pb0")]
+
+
+
+for (i in 1:10){
+
+index <- sample(1:nrow(data.rf),size = 0.8*nrow(data.rf)) 
+
+train <- data.rf[index, ]
+test <- data.rf[-index, ]
+RMSE.baseline <- sqrt(mean((mean(train$return)-test$return)^2))
+
+#Linear Model
+lin.reg <- lm(return~., data = train)
+summary(lin.reg)
+test.pred.lin <- predict(lin.reg, test)
+RMSE.lin.reg <- sqrt(mean((test.pred.lin-test$return)^2))
+
+#AIC Linear Model
+lin.reg.aic <- step(lin.reg, scope = list(lower=~1, upper = lin.reg), direction = "both")
+test.pred.lin.aic <- predict(lin.reg.aic, test)
+RMSE.lin.reg.aic <- sqrt(mean((test.pred.lin.aic - test$return)^2))
+
+#BIC Linear Model
+lin.reg.bic <- step(lin.reg, scope = list(lower=~1, upper = lin.reg), direction = "both", k = log(n))
+test.pred.lin.bic <- predict(lin.reg.bic, test)
+RMSE.lin.reg.bic <- sqrt(mean((test.pred.lin.bic - test$return)^2))
+
+
+#Decision Tree
+rt <- rpart(return~., data=train)
+summary(rt)
+#plot(rt)
+#text(rt)
+test.pred.rtree <- predict(rt,test)
+RMSE.rtree <- sqrt(mean((test.pred.rtree-test$return)^2))
+
+#printcp(rt)
+min.xerror <- rt$cptable[which.min(rt$cptable[,"xerror"]),"CP"]
+rt.pruned <- prune(rt,cp = min.xerror)
+#plot(rt.pruned, compress=TRUE)
+#text(rt.pruned, use.n = TRUE)
+test.pred.rtree.p <- predict(rt.pruned,test)
+RMSE.rtree.pruned <- sqrt(mean((test.pred.rtree.p-test$return)^2))
+
+#Random Forest
+rf <- randomForest(return~., data = train, importance = TRUE, ntree = 1000)
+which.min(rf$mse)
+#plot(rf)
+#imp <- as.data.frame(sort(importance(rf)[,1],decreasing = TRUE),optional = T)
+#names(imp) <- "% Inc MSE"
+#imp
+test.pred.forest <- predict(rf,test)
+RMSE.forest <- sqrt(mean((test.pred.forest-test$return)^2))
+
+
+vec.rmse[1, 1] <- RMSE.baseline
+vec.rmse[2, 1] <- RMSE.lin.reg
+vec.rmse[3, 1] <- RMSE.lin.reg.aic
+vec.rmse[4, 1] <- RMSE.lin.reg.bic
+vec.rmse[5, 1] <- RMSE.rtree
+vec.rmse[6, 1] <- RMSE.rtree.pruned
+vec.rmse[7, 1] <- RMSE.forest
+
+table.rmse[, i] <- vec.rmse
+}
+
+table.rmse[, 11] <- rowMeans(table.rmse[, 1:10])
+table.rmse[, 12] <- 1 - table.rmse[, 11]^2/table.rmse[1, 11]^2
+table.rmse 
+plot(table.rmse[, 11])
+plot(table.rmse[, 12])
+abline(h = 0)
+
+```
+
+
+
+```{r}
+
+#Closing Price
+data$return <- data$rclose
+
+#AIC Linear Model
+reg.aic <- step(lm(return~., data=data.rf), scope = list(lower=~1, upper=~., direction = "both"))
+data$rclose.aic <- predict(reg.aic, data)
+
+#BIC Linear Model
+reg.bic <- step(lm(return~., data=data.rf), scope = list(lower=~1, upper=~.), direction = "both", k = log(n))
+data$rclose.bic <- predict(reg.bic, data)
+
+#Random Forest
+rf <- randomForest(return~., data = subset(data.rf, is.na(return)=="FALSE"), importance = TRUE, ntree = 1000)
+data$rclose.rf <- predict(rf, data)
+
+data$rclose.avg <- (data$rclose.fit + (data$rclose.aic + data$rclose.bic)/2 + data$rclose.rf)/3
+
+data[(nrow(data)-15):nrow(data), c("ASX_Code", "rclose", "rclose.fit", "rclose.aic", "rclose.bic", "rclose.rf", "rclose.avg")]
+
+
+
+
+```
+
+
+
+```{r Levels analysis}
+
+data$pb0 <- log(1000*data$mc*data$Shares/data$SharesFD) - log(data$Assets)
+data$pb <- log(1000*data$mcM*data$Shares/data$SharesFD+data$Liab)-log(data$Assets)
+data$pb1w <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P1week/data$Pclose+data$Liab)-log(data$Assets)
+data$pb1m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P1m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb3m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P3m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb6m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P6m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb9m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P9m/data$Pclose+data$Liab)-log(data$Assets)
+data$pb12m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P12m/data$Pclose+data$Liab)-log(data$Assets)
+
+x <- subset(x, select = -c(i.mc, l.pb))
+#x = subset(x, d_man==0)
+#x$i_assets <- 1000/(10000+data$Assets)
+
+#function for calculating predicted value
+cv.fit <- function(series1){
+y <- series1
+data$fit <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*data$Assets - data$Liab) - data$pb0
+eq <- lm(series1~fit + I(1/Assets), data)
+return(predict(eq, data))
+}
+
+
+#function for calculating cross validated predicted value
+cv.fit1 <- function(series1){
+data$fit[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+data$fit <- log(exp(data$fit)*data$Assets - data$Liab) - data$pb0
+data$fit0 <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*data$Assets - data$Liab) - data$pb0
+eq <- lm(series1~fit + I(1/Assets), data)
+data$fit <- coef(eq)[1] + coef(eq)[2]*data$fit + coef(eq)[3]*1/data$Assets
+return(data$fit)
+}
+
+
+#Saving coefficients
+tbl.lambda.l <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.l) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.l) <- names
+
+
+
+####Closing Price
+data$fit <- NA
+y <- data$pb
+cv.out <- estimate.fn()
+data$rclose.fit.l <- cv.fit(data$rclose)
+chart.fit(data$rclose.fit.l, data$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#cross validated predictions          
+data$rclose.cv.l <- NA
+data$rclose.cv.l <- cv.fit1(data$rclose)
+
+#measures of fit
+y <- data$rclose
+tbl.lambda.l <- save.fn(1, data$rclose.fit.l, data$rclose.cv.l, tbl.lambda.l)
+
+
+####1 Week price
+y <- data$pb1w
+cv.out <- estimate.fn()
+data$r1w.fit.l <- cv.fit(data$r1w)
+chart.fit(data$r1w.fit.l, data$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#cross validated predictions          
+data$r1w.cv.l <- NA
+data$r1w.cv.l <- cv.fit1(data$r1w)
+
+#measures of fit
+y <- data$r1w
+tbl.lambda.l <- save.fn(2, data$r1w.fit.l, data$r1w.cv.l, tbl.lambda.l)
+
+
+####1 Month price
+y <- data$pb1m
+cv.out <- estimate.fn()
+data$r1m.fit.l <- cv.fit(data$r1m)
+chart.fit(data$r1m.fit.l, data$r1m, min(cv.out$cvm)^0.5, "r1m")
+
+#cross validated predictions          
+data$r1m.cv.l <- NA
+data$r1m.cv.l <- cv.fit1(data$r1m)
+
+#measures of fit
+y <- data$r1m
+tbl.lambda.l <- save.fn(3, data$r1m.fit.l, data$r1m.cv.l, tbl.lambda.l)
+
+####3 Month price
+y <- data$pb3m
+cv.out <- estimate.fn()
+data$r3m.fit.l <- cv.fit(data$r3m)
+chart.fit(data$r3m.fit.l, data$r3m, min(cv.out$cvm)^0.5, "r3m")
+
+#cross validated predictions          
+data$r3m.cv.l <- NA
+data$r3m.cv.l <- cv.fit1(data$r3m)
+
+#measures of fit
+y <- data$r3m
+tbl.lambda.l <- save.fn(4, data$r3m.fit.l, data$r3m.cv.l, tbl.lambda.l)
+
+
+
+#### 6 Month Price
+y <- data$pb6m
+cv.out <- estimate.fn()
+data$r6m.fit.l <- cv.fit(data$r6m)
+chart.fit(data$r6m.fit.l, data$r6m, min(cv.out$cvm)^0.5, "rclose")
+
+#cross validated predictions          
+data$r6m.cv.l <- NA
+data$r6m.cv.l <- cv.fit1(data$r6m)
+
+#measures of fit
+y <- data$r6m
+tbl.lambda.l <- save.fn(5, data$r6m.fit.l, data$r6m.cv.l, tbl.lambda.l)
+
+
+
+#### 9 Month Price
+y <- data$pb9m
+cv.out <- estimate.fn()
+data$r9m.fit.l <- cv.fit(data$r9m)
+chart.fit(data$r9m.fit.l, data$r9m, min(cv.out$cvm)^0.5, "r9m")
+
+#cross validated predictions          
+data$r9m.cv.l <- NA
+data$r9m.cv.l <- cv.fit1(data$r6m)
+
+#measures of fit
+y <- data$r9m
+tbl.lambda.l <- save.fn(6, data$r9m.fit.l, data$r9m.cv.l, tbl.lambda.l)
+
+
+#### 12 Month Price
+y <- data$pb12m
+cv.out <- estimate.fn()
+data$r12m.fit.l <- cv.fit(data$r12m)
+chart.fit(data$r12m.fit.l, data$r12m, min(cv.out$cvm)^0.5, "r12m")
+
+#cross validated predictions          
+data$r12m.cv.l <- NA
+data$r12m.cv.l <- cv.fit1(data$r12m)
+
+#measures of fit
+y <- data$r12m
+tbl.lambda.l <- save.fn(7, data$r12m.fit.l, data$r12m.cv.l, tbl.lambda.l)
+
+
+#Table of Level Return Forecasts
+data[(nrow(data)-12):nrow(data), c("ASX_Code", "rclose.fit.l", "r1w.fit.l", "r1m.fit.l", "r3m.fit.l", "r6m.fit.l", "r9m.fit.l", "r12m.fit.l")]
+
+#Averages
+data$rclose.avg <- (data$rclose.fit + data$rclose.fit.l)/2
+data$r1w.avg <- (data$r1w.fit + data$r1w.fit.l)/2
+data$r1m.avg <- (data$r1m.fit + data$r1m.fit.l)/2
+data$r3m.avg <- (data$r3m.fit + data$r3m.fit.l)/2
+data$r6m.avg <- (data$r6m.fit + data$r6m.fit.l)/2
+data$r9m.avg <- (data$r9m.fit + data$r9m.fit.l)/2
+data$r12m.avg <- (data$r12m.fit + data$r12m.fit.l)/2
+
+data[(nrow(data)-12):nrow(data), c("ASX_Code", "rclose.avg", "r1w.avg", "r1m.avg", "r3m.avg", "r6m.avg", "r9m.avg", "r12m.avg")]
+
+```
+
+
+
+
+
+
+
+
+
+```{r Manufacturing}
+
+data$r.ebit <- data$EBIT_A/data$Assets
+data$r.cfo <- data$CFO_A/data$Assets
+
+#data <- subset(data, d_man > 0)
+data <- subset(data, d.services ==1)
+                
+x <- data[, c("i_assets", 
+              "l.years",
+              "sales_zero",
+              "ebit.neg",
+              "sales.assets", 
+              "r.ebit", 
+              "r.cfo",
+              "r.cash", 
+              "shareRaise",
+              "countryRisk", 
+              "sIPO", 
+              "sMGT", 
+              "sTOP",
+              "cost", 
+ #             "escrow",
+              "r.consideration", 
+              "r.convertible",
+              "r.vendor.sales")]
+
+
+#Saving coefficients
+tbl.lambda.man <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.man) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.man) <- names
+
+
+####Closing Price
+y <- data$pb
+cv.out <- estimate.fn()
+data$rclose.fit.man <- cv.fit(data$rclose)
+chart.fit(data$rclose.fit.man, data$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#cross validated predictions          
+data$rclose.cv.man <- NA
+data$rclose.cv.man <- cv.fit1(data$rclose)
+
+#measures of fit
+y <- data$rclose
+tbl.lambda.man <- save.fn(1, data$rclose.fit.man, data$rclose.cv.man, tbl.lambda.man)
+
+
+####1 Week price
+y <- data$pb1w
+cv.out <- estimate.fn()
+data$r1w.fit.man <- cv.fit(data$r1w)
+chart.fit(data$r1w.fit.man, data$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#cross validated predictions          
+data$r1w.cv.man <- NA
+data$r1w.cv.man <- cv.fit1(data$r1w)
+
+#measures of fit
+y <- data$r1w
+tbl.lambda.man <- save.fn(2, data$r1w.fit.man, data$r1w.cv.man, tbl.lambda.man)
+
+
+####1 Month price
+y <- data$pb1m
+cv.out <- estimate.fn()
+data$r1m.fit.man <- cv.fit(data$r1m)
+chart.fit(data$r1m.fit.man, data$r1m, min(cv.out$cvm)^0.5, "r1m")
+
+#cross validated predictions          
+data$r1m.cv.man <- NA
+data$r1m.cv.man <- cv.fit1(data$r1m)
+
+#measures of fit
+y <- data$r1m
+tbl.lambda.man <- save.fn(3, data$r1m.fit.man, data$r1m.cv.man, tbl.lambda.man)
+
+####3 Month price
+y <- data$pb3m
+cv.out <- estimate.fn()
+data$r3m.fit.man <- cv.fit(data$r3m)
+chart.fit(data$r3m.fit.man, data$r3m, min(cv.out$cvm)^0.5, "r3m")
+
+#cross validated predictions          
+data$r3m.cv.man <- NA
+data$r3m.cv.man <- cv.fit1(data$r3m)
+
+#measures of fit
+y <- data$r3m
+tbl.lambda.man <- save.fn(4, data$r3m.fit.man, data$r3m.cv.man, tbl.lambda.man)
+
+
+
+#### 6 Month Price
+y <- data$pb6m
+cv.out <- estimate.fn()
+data$r6m.fit.man <- cv.fit(data$r6m)
+chart.fit(data$r6m.fit.man, data$r6m, min(cv.out$cvm)^0.5, "r6m")
+
+#cross validated predictions          
+data$r6m.cv.man <- NA
+data$r6m.cv.man <- cv.fit1(data$r6m)
+
+#measures of fit
+y <- data$r6m
+tbl.lambda.man <- save.fn(5, data$r6m.fit.man, data$r6m.cv.man, tbl.lambda.man)
+
+
+
+#### 9 Month Price
+y <- data$pb9m
+cv.out <- estimate.fn()
+data$r9m.fit.man <- cv.fit(data$r9m)
+chart.fit(data$r9m.fit.man, data$r9m, min(cv.out$cvm)^0.5, "r9m")
+
+#cross validated predictions          
+data$r9m.cv.man <- NA
+data$r9m.cv.man <- cv.fit1(data$r6m)
+
+#measures of fit
+y <- data$r9m
+tbl.lambda.man <- save.fn(6, data$r9m.fit.man, data$r9m.cv.man, tbl.lambda.man)
+
+
+#### 12 Month Price
+y <- data$pb12m
+cv.out <- estimate.fn()
+data$r12m.fit.man <- cv.fit(data$r12m)
+chart.fit(data$r12m.fit.man, data$r12m, min(cv.out$cvm)^0.5, "r12m")
+
+#cross validated predictions          
+data$r12m.cv.man <- NA
+data$r12m.cv.man <- cv.fit1(data$r12m)
+
+#measures of fit
+y <- data$r12m
+tbl.lambda.man <- save.fn(7, data$r12m.fit.man, data$r12m.cv.man, tbl.lambda.man)
+
+
+#Table of Level Return Forecasts
+data[(nrow(data)-12):nrow(data), c("ASX_Code", "rclose.fit.man", "r1w.fit.man", "r1m.fit.man", "r3m.fit.man", "r6m.fit.man", "r9m.fit.man", "r12m.fit.man")]
+
+#Averages
+data$rclose.man <- (data$rclose.fit + data$rclose.fit.l + data$rclose.fit.man)/3
+data$r1w.man <- (data$r1w.fit + data$r1w.fit.l + data$r1w.fit.man)/3
+data$r1m.man <- (data$r1m.fit + data$r1m.fit.l + data$r1m.fit.man)/3
+data$r3m.man <- (data$r3m.fit + data$r3m.fit.l + data$r3m.fit.man)/3
+data$r6m.man <- (data$r6m.fit + data$r6m.fit.l + data$r6m.fit.man)/3
+data$r9m.man <- (data$r9m.fit + data$r9m.fit.l + data$r9m.fit.man)/3
+data$r12m.man <- (data$r12m.fit +data$r12m.fit.l + data$r12m.fit.man)/3
+
+data[(nrow(data)-12):nrow(data), c("ASX_Code", "rclose.man", "r1w.man", "r1m.man", "r3m.man", "r6m.man", "r9m.man", "r12m.man")]
+
+
+```
+
+
+
+
+#Peer Group comparisons
+
+```{r Companeis with No Revenue}
+
+chart.fit <- function(fit, actual, se, title) {  
+plot(fit, actual, main=title)
+text(fit, actual, labels=df1$ASX_Code, cex=0.5, pos=2)
+abline(a=0, b=1)
+abline(a=-se, b=1, col="red")
+abline(a=se, b=1, col="red")
+abline(h=0) }
+
+
+#data_old <- data
+#data <- df1
+#data$Sales_A <- 1
+#data$gMargin <- ifelse(is.na(data$gMargin)=="FALSE", data$gMargin, 1)
+#charts.fn(data$rclose, mean(data$rclose, na.rm=TRUE))
+#data <- data_old
+
+#Equation for No Revenue Companies
+df1 <- subset(data, Sales_A <= 0)
+
+
+x <- df1[, c("i_assets", 
+#             "l.years", 
+#             "r.ebit", 
+#             "countryRisk", 
+#             "shareRaise", 
+             "sales_target", 
+#             "cost", 
+             "r.cash", 
+#             "sIPO", 
+#             "sMGT", 
+             "sTOP", 
+#             "offerRange", 
+#             "r_options", 
+#             "Technology",
+             "IP"
+#,           "l.pb"
+                )]
+
+
+
+#Saving coefficients
+tbl.lambda.n <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.n) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.n) <- names
+
+
+####Closing Price
+y <- df1$rclose
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df1$rclose.cv.n <- NA
+df1$rclose.cv.n[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df1$rclose.fit.n <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df1$rclose.fit.n, df1$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#measures of fit
+tbl.lambda.n <- save.fn(1, df1$rclose.fit.n, df1$rclose.cv.n, tbl.lambda.n)
+
+
+####1 Week Return
+y <- df1$r1w
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df1$r1w.cv.n <- NA
+df1$r1w.cv.n[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df1$r1w.fit.n <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df1$r1w.fit.n, df1$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#measures of fit
+tbl.lambda.n <- save.fn(2, df1$r1w.fit.n, df1$r1w.cv.n, tbl.lambda.n)
+
+
+
+
+####1 Month Return
+y <- df1$r1m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df1$r1m.cv.n <- NA
+df1$r1m.cv.n[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df1$r1m.fit.n <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df1$r1m.fit.n, df1$r1m, min(cv.out$cvm)^0.5, "r1m")
+
+#measures of fit
+tbl.lambda.n <- save.fn(3, df1$r1m.fit.n, df1$r1m.cv.n, tbl.lambda.n)
+
+
+
+####3 Month Return
+y <- df1$r3m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df1$r3m.cv.n <- NA
+df1$r3m.cv.n[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df1$r3m.fit.n <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df1$r3m.fit.n, df1$r3m, min(cv.out$cvm)^0.5, "r3m")
+
+#measures of fit
+tbl.lambda.n <- save.fn(4, df1$r3m.fit.n, df1$r3m.cv.n, tbl.lambda.n)
+
+
+
+####6 Month Return
+y <- df1$r6m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df1$r6m.cv.n <- NA
+df1$r6m.cv.n[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df1$r6m.fit.n <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df1$r6m.fit.n, df1$r6m, min(cv.out$cvm)^0.5, "r6m")
+
+#measures of fit
+tbl.lambda.n <- save.fn(5, df1$r6m.fit.n, df1$r6m.cv.n, tbl.lambda.n)
+
+
+####9 Month Return
+y <- df1$r9m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df1$r9m.cv.n <- NA
+df1$r9m.cv.n[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df1$r9m.fit.n <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df1$r9m.fit.n, df1$r9m, min(cv.out$cvm)^0.5, "r9m")
+
+#measures of fit
+tbl.lambda.n <- save.fn(6, df1$r9m.fit.n, df1$r9m.cv.n, tbl.lambda.n)
+
+
+####12 Month Return
+y <- df1$r12m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df1$r12m.cv.n <- NA
+df1$r12m.cv.n[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df1$r12m.fit.n <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df1$r12m.fit.n, df1$r12m, min(cv.out$cvm)^0.5, "r12m")
+
+#measures of fit
+tbl.lambda.n <- save.fn(7, df1$r12m.fit.n, df1$r12m.cv.n, tbl.lambda.n)
+
+df1[(nrow(df1)-12):nrow(df1), c("ASX_Code", "rclose.fit.n", "r1w.fit.n", "r1m.fit.n", "r3m.fit.n", "r6m.fit.n", "r9m.fit.n", "r12m.fit.n")]
+
+```
+
+
+
+
+
+
+```{r Pre-revenue companies - levels equation}
+
+
+plot(log(df1$NetTangibleAssets + df1$Liab), log(df1$mcM*1000*df1$Shares/df1$SharesFD+df1$Liab))
+text(log(df1$NetTangibleAssets + df1$Liab), log(df1$mcM*1000*df1$Shares/df1$SharesFD+df1$Liab), labels=df1$ASX_Code, cex=0.5, pos=2)
+abline(a=mean(log((1000*df1$mcM*df1$Shares/df1$SharesFD+df1$Liab)/(df1$NetTangibleAssets+df1$Liab)), na.rm=TRUE), b=1, col="red")
+
+
+#Saving coefficients
+tbl.lambda.nl <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.nl) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.nl) <- names
+
+####Closing Price
+y <- log((1000*df1$mcM*df1$Shares/df1$SharesFD+df1$Liab)/df1$Assets)
+cv.out <- estimate.fn()
+y <- df1$rclose
+#fitted values and chart
+df1$rclose.fit.nl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df1$Assets - df1$Liab) - log(1000*df1$mc*df1$Shares/df1$SharesFD)
+df1$rclose.fit.nl <- predict(lm(rclose~rclose.fit.nl, df1), df1)
+chart.fit(df1$rclose.fit.nl, df1$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#cross validated predictions          
+df1$rclose.cv.nl <- NA
+df1$rclose.cv.nl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df1$rclose.cv.nl <- df1$rclose.cv.nl - log((1000*df1$mc*df1$Shares/df1$SharesFD + df1$Liab)/df1$Assets)
+df1$rclose.cv.nl <- (1-0.6)*mean(y, na.rm=TRUE) + 0.6*df1$rclose.cv.nl
+
+#measures of fit
+tbl.lambda.nl <- save.fn(1, df1$rclose.fit.nl, df1$rclose.cv.nl, tbl.lambda.nl)
+
+
+#### 1 Week Price
+y <- log((1000*df1$mcM*df1$Shares/df1$SharesFD*df1$P1week/df1$Pclose+df1$Liab)/df1$Assets)
+cv.out <- estimate.fn()
+y <- df1$r1w
+#fitted values and chart
+df1$r1w.fit.nl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df1$Assets - df1$Liab) - log(1000*df1$mc*df1$Shares/df1$SharesFD)
+df1$r1w.fit.nl <- predict(lm(r1w~r1w.fit.nl, df1), df1)
+chart.fit(df1$r1w.fit.nl, df1$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#cross validated predictions          
+df1$r1w.cv.nl <- NA
+df1$r1w.cv.nl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df1$r1w.cv.nl <- df1$r1w.cv.nl - log((1000*df1$mc*df1$Shares/df1$SharesFD + df1$Liab)/df1$Assets)
+df1$r1w.cv.nl <- (1-0.7)*mean(y, na.rm=TRUE) + 0.7*df1$r1w.cv.nl
+
+#measures of fit
+tbl.lambda.nl <- save.fn(2, df1$r1w.fit.nl, df1$r1w.cv.nl, tbl.lambda.nl)
+
+
+
+#### 1 Month Price
+y <- log((1000*df1$mcM*df1$Shares/df1$SharesFD*df1$P1m/df1$Pclose+df1$Liab)/df1$Assets)
+cv.out <- estimate.fn()
+y <- df1$r1m
+#fitted values and chart
+df1$r1m.fit.nl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df1$Assets - df1$Liab) - log(1000*df1$mc*df1$Shares/df1$SharesFD)
+df1$r1m.fit.nl <- predict(lm(r1m~r1m.fit.nl, df1), df1)
+chart.fit(df1$r1m.fit.nl, df1$r1m, min(cv.out$cvm)^0.5, "r1m")
+#cross validated predictions          
+df1$r1m.cv.nl <- NA
+df1$r1m.cv.nl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df1$r1m.cv.nl <- df1$r1m.cv.nl - log((1000*df1$mc*df1$Shares/df1$SharesFD + df1$Liab)/df1$Assets)
+df1$r1m.cv.nl <- (1-0.7)*mean(y, na.rm=TRUE) + 0.7*df1$r1m.cv.nl
+#measures of fit
+tbl.lambda.nl <- save.fn(3, df1$r1m.fit.nl, df1$r1m.cv.nl, tbl.lambda.nl)
+
+
+
+#### 3 Month Price
+y <- log((1000*df1$mcM*df1$Shares/df1$SharesFD*df1$P3m/df1$Pclose+df1$Liab)/df1$Assets)
+cv.out <- estimate.fn()
+y <- df1$r3m
+#fitted values and chart
+df1$r3m.fit.nl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df1$Assets - df1$Liab) - log(1000*df1$mc*df1$Shares/df1$SharesFD)
+df1$r3m.fit.nl <- predict(lm(r3m~r3m.fit.nl, df1), df1)
+chart.fit(df1$r3m.fit.nl, df1$r3m, min(cv.out$cvm)^0.5, "r3m")
+#cross validated predictions          
+df1$r3m.cv.nl <- NA
+df1$r3m.cv.nl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df1$r3m.cv.nl <- df1$r3m.cv.nl - log((1000*df1$mc*df1$Shares/df1$SharesFD + df1$Liab)/df1$Assets)
+df1$r3m.cv.nl <- (1-0.75)*mean(y, na.rm=TRUE) + 0.75*df1$r3m.cv.nl
+#measures of fit
+tbl.lambda.nl <- save.fn(4, df1$r3m.fit.nl, df1$r3m.cv.nl, tbl.lambda.nl)
+
+
+
+#### 6 Month Price
+y <- log((1000*df1$mcM*df1$Shares/df1$SharesFD*df1$P6m/df1$Pclose+df1$Liab)/df1$Assets)
+cv.out <- estimate.fn()
+y <- df1$r6m
+#fitted values and chart
+df1$r6m.fit.nl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df1$Assets - df1$Liab) - log(1000*df1$mc*df1$Shares/df1$SharesFD)
+df1$r6m.fit.nl <- predict(lm(r6m~r6m.fit.nl, df1), df1)
+chart.fit(df1$r6m.fit.nl, df1$r6m, min(cv.out$cvm)^0.5, "r6m")
+#cross validated predictions          
+df1$r6m.cv.nl <- NA
+df1$r6m.cv.nl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df1$r6m.cv.nl <- df1$r6m.cv.nl - log((1000*df1$mc*df1$Shares/df1$SharesFD + df1$Liab)/df1$Assets)
+df1$r6m.cv.nl <- (1-0.8)*mean(y, na.rm=TRUE) + 0.8*df1$r6m.cv.nl
+#measures of fit
+tbl.lambda.nl <- save.fn(5, df1$r6m.fit.nl, df1$r6m.cv.nl, tbl.lambda.nl)
+
+
+
+#### 9 Month Price
+y <- log((1000*df1$mcM*df1$Shares/df1$SharesFD*df1$P9m/df1$Pclose+df1$Liab)/df1$Assets)
+cv.out <- estimate.fn()
+y <- df1$r9m
+#fitted values and chart
+df1$r9m.fit.nl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df1$Assets - df1$Liab) - log(1000*df1$mc*df1$Shares/df1$SharesFD)
+df1$r9m.fit.nl <- predict(lm(r9m~r9m.fit.nl, df1), df1)
+chart.fit(df1$r9m.fit.nl, df1$r9m, min(cv.out$cvm)^0.5, "r9m")
+#cross validated predictions          
+df1$r9m.cv.nl <- NA
+df1$r9m.cv.nl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df1$r9m.cv.nl <- df1$r9m.cv.nl - log((1000*df1$mc*df1$Shares/df1$SharesFD + df1$Liab)/df1$Assets)
+df1$r9m.cv.nl <- (1-0.9)*mean(y, na.rm=TRUE) + 0.9*df1$r9m.cv.nl
+#measures of fit
+tbl.lambda.nl <- save.fn(6, df1$r9m.fit.nl, df1$r9m.cv.nl, tbl.lambda.nl)
+
+
+#### 12 Month Price
+y <- log((1000*df1$mcM*df1$Shares/df1$SharesFD*df1$P12m/df1$Pclose+df1$Liab)/df1$Assets)
+cv.out <- estimate.fn()
+y <- df1$r12m
+#fitted values and chart
+df1$r12m.fit.nl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df1$Assets - df1$Liab) - log(1000*df1$mc*df1$Shares/df1$SharesFD)
+df1$r12m.fit.nl <- predict(lm(r12m~r12m.fit.nl, df1), df1)
+chart.fit(df1$r12m.fit.nl, df1$r12m, min(cv.out$cvm)^0.5, "r12m")
+#cross validated predictions          
+df1$r12m.cv.nl <- NA
+df1$r12m.cv.nl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df1$r12m.cv.nl <- df1$r12m.cv.nl - log((1000*df1$mc*df1$Shares/df1$SharesFD + df1$Liab)/df1$Assets)
+df1$r12m.cv.nl <- (1-1)*mean(y, na.rm=TRUE) + 1*df1$r12m.cv.nl
+#measures of fit
+tbl.lambda.nl <- save.fn(7, df1$r12m.fit.nl, df1$r12m.cv.nl, tbl.lambda.nl)
+
+
+#Table of Level Return Forecasts
+df1[(nrow(df1)-12):nrow(df1), c("ASX_Code", "rclose.fit.nl", "r1w.fit.nl", "r1m.fit.nl", "r3m.fit.nl", "r6m.fit.nl", "r9m.fit.nl", "r12m.fit.nl")]
+
+#Averages
+df1$rclose.avg.n <- (df1$rclose.fit.n + df1$rclose.fit.nl)/2
+df1$r1w.avg.n <- (df1$r1w.fit.n + df1$r1w.fit.nl)/2
+df1$r1m.avg.n <- (df1$r1m.fit.n + df1$r1m.fit.nl)/2
+df1$r3m.avg.n <- (df1$r3m.fit.n + df1$r3m.fit.nl)/2
+df1$r6m.avg.n <- (df1$r6m.fit.n + df1$r6m.fit.nl)/2
+df1$r9m.avg.n <- (df1$r9m.fit.n + df1$r9m.fit.nl)/2
+df1$r12m.avg.n <- (df1$r12m.fit.n + df1$r12m.fit.nl)/2
+
+df1[(nrow(df1)-12):nrow(df1), c("ASX_Code", "rclose.avg.n", "r1w.avg.n", "r1m.avg.n", "r3m.avg.n", "r6m.avg.n", "r9m.avg.n", "r12m.avg.n")]
+
+#Global averages
+df1$rclose.t <- (df1$rclose.avg + df1$rclose.avg.n)/2
+df1$r1w.t <- (df1$r1w.avg + df1$r1w.avg.n)/2
+df1$r1m.t <- (df1$r1m.avg + df1$r1m.avg.n)/2
+df1$r3m.t <- (df1$r3m.avg + df1$r3m.avg.n)/2
+df1$r6m.t <- (df1$r6m.avg + df1$r6m.avg.n)/2
+df1$r9m.t <- (df1$r9m.avg + df1$r9m.avg.n)/2
+df1$r12m.t <- (df1$r12m.avg + df1$r12m.avg.n)/2
+
+df1[(nrow(df1)-12):nrow(df1), c("ASX_Code", "rclose.t", "r1w.t", "r1m.t", "r3m.t", "r6m.t", "r9m.t", "r12m.t")]
+
+```
+
+```{r FIRE}
+
+data$pb <- log(1000*data$mcM*data$Shares/data$SharesFD + data$Liab) - log(data$Assets)
+data$r.cfo <- data$CFO_A/data$Assets
+
+#df2 <- subset(data, Division %in% c("Finance and Insurance Services", "Rental Hiring and Real Estate Services"))
+
+df2 <- subset(data, Division == "Agriculture Forestry and Fishing")
+
+#data_old <- data
+#data <- df2
+#charts.fn(df2$pb, mean(df2$pb, na.rm=TRUE))
+#data <- data_old
+
+
+chart.fit <- function(fit, actual, se, title) {  
+plot(fit, actual, main=title)
+text(fit, actual, labels=df2$ASX_Code, cex=0.5, pos=2)
+abline(a=0, b=1)
+abline(a=-se, b=1, col="red")
+abline(a=se, b=1, col="red")
+abline(h=0) }
+
+             
+x <- df2[, c(
+             "i_assets", 
+#              "i.mc",
+#              "l.years", 
+#              "sales_zero", 
+#              "ebit.neg", 
+#              "no.ebit",
+#              "no.cfo",
+#              "sales.assets", 
+#              "r.ebit.zero", 
+#              "r.ebit.sales",
+#              "r.cfo.zero",
+#              "r.cfo.sales",
+#              "forecasts", 
+              "r.cfo",
+              "r.cash", 
+#              "shareRaise",
+#              "div.zero", 
+#              "Dividend", 
+#              "r.rnd", 
+#              "r_inv",
+#              "d.prof.services", 
+#              "d.information",
+#              "d.retail",
+#              "d.wholesale", 
+#              "d.egw",
+#              "d.fin",
+#              "d.healthcare",
+#              "d.education",
+#              "d.construction",
+#              "d.services",
+#              "d.realestate",
+#              "d.transport",
+#              "Australia", 
+#              "AusMarket",
+              "countryRisk", 
+#              "specHigh", 
+#              "spec.low", 
+#              "IP",
+              "sIPO", 
+              "sMGT", 
+#              "optsMGT",
+              "sTOP"
+#              "sLM", 
+#              "sLM.zero",
+#              "escrow", 
+#              "r.int", 
+#              "d.Underwritten", 
+#              "d_OMBB", 
+#              "offerRange", 
+#              "r_options", 
+#              "broker.share", 
+#              "auditor.share", 
+#              "cost", 
+#              "r.consideration", 
+#              "r.convertible",
+#              "r.vendor.sales", 
+#              "r.asset.acq", 
+#              "r.research", 
+#              "r_investment", 
+#              "r.marketing", 
+#              "r.working.cap", 
+#              "no.broker", 
+#              "r.current", 
+#              "r.recievables",
+#              "sales_target",
+#              "profit.target", 
+#              "price.target",
+#              "l.pb"
+                )]
+
+
+#Saving coefficients
+tbl.lambda.rl <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.rl) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.rl) <- names
+
+####Closing Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$rclose
+#fitted values and chart
+df2$rclose.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$rclose.fit.rl <- predict(lm(rclose~rclose.fit.rl, df2), df2)
+chart.fit(df2$rclose.fit.rl, df2$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#cross validated predictions          
+df2$rclose.cv.rl <- NA
+df2$rclose.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$rclose.cv.rl <- df2$rclose.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$rclose.cv.rl <- (1-0.25)*mean(y, na.rm=TRUE) + 0.25*df2$rclose.cv.rl
+
+#measures of fit
+tbl.lambda.rl <- save.fn(1, df2$rclose.fit.rl, df2$rclose.cv.rl, tbl.lambda.rl)
+
+
+#### 1 Week Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P1week/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r1w
+#fitted values and chart
+df2$r1w.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r1w.fit.rl <- predict(lm(r1w~r1w.fit.rl, df2), df2)
+chart.fit(df2$r1w.fit.rl, df2$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#cross validated predictions          
+df2$r1w.cv.rl <- NA
+df2$r1w.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r1w.cv.rl <- df2$r1w.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r1w.cv.rl <- (1-0.3)*mean(y, na.rm=TRUE) + 0.3*df2$r1w.cv.rl
+
+#measures of fit
+tbl.lambda.rl <- save.fn(2, df2$r1w.fit.rl, df2$r1w.cv.rl, tbl.lambda.rl)
+
+
+
+#### 1 Month Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P1m/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r1m
+#fitted values and chart
+df2$r1m.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r1m.fit.rl <- predict(lm(r1m~r1m.fit.rl, df2), df2)
+chart.fit(df2$r1m.fit.rl, df2$r1m, min(cv.out$cvm)^0.5, "r1m")
+#cross validated predictions          
+df2$r1m.cv.rl <- NA
+df2$r1m.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r1m.cv.rl <- df2$r1m.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r1m.cv.rl <- (1-0.4)*mean(y, na.rm=TRUE) + 0.4*df2$r1m.cv.rl
+#measures of fit
+tbl.lambda.rl <- save.fn(3, df2$r1m.fit.rl, df2$r1m.cv.rl, tbl.lambda.rl)
+
+
+
+#### 3 Month Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P3m/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r3m
+#fitted values and chart
+df2$r3m.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r3m.fit.rl <- predict(lm(r3m~r3m.fit.rl, df2), df2)
+chart.fit(df2$r3m.fit.rl, df2$r3m, min(cv.out$cvm)^0.5, "r3m")
+#cross validated predictions          
+df2$r3m.cv.rl <- NA
+df2$r3m.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r3m.cv.rl <- df2$r3m.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r3m.cv.rl <- (1-0.35)*mean(y, na.rm=TRUE) + 0.35*df2$r3m.cv.rl
+#measures of fit
+tbl.lambda.rl <- save.fn(4, df2$r3m.fit.rl, df2$r3m.cv.rl, tbl.lambda.rl)
+
+
+
+
+
+```
+
+
+
+```{r Equation for Revenue Companies}
+
+df2 <- subset(data, Sales_A > 0 & Sales_A <= 10000)
+df2[nrow(df2)+1, ] <- data[data$ASX_Code == "14D", ]
+#data_old <- data
+#data <- df2
+#charts.fn(data$rclose, mean(data$rclose, na.rm=TRUE))
+#charts.fn(data$r12m, mean(data$r12m, na.rm=TRUE))
+#data <- data_old
+
+chart.fit <- function(fit, actual, se, title) {  
+plot(fit, actual, main=title)
+text(fit, actual, labels=df2$ASX_Code, cex=0.5, pos=2)
+abline(a=0, b=1)
+abline(a=-se, b=1, col="red")
+abline(a=se, b=1, col="red")
+abline(h=0) }
+
+             
+x <- df2[, c("i_assets", 
+#              "i.mc",
+              "l.years", 
+#              "sales_zero", 
+              "ebit.neg", 
+#              "no.ebit",
+#              "no.cfo",
+              "sales.assets", 
+#              "r.ebit.zero", 
+#              "r.ebit.sales",
+#              "r.cfo.zero",
+              "r.cfo.sales",
+#              "forecasts", 
+              "r.cash", 
+              "shareRaise",
+#              "div.zero", 
+#              "Dividend", 
+#              "r.rnd", 
+#              "r_inv",
+#              "d.prof.services", 
+#              "d.information",
+#              "d.retail",
+#              "d.wholesale", 
+#              "d.egw",
+#              "d.fin",
+#              "d.healthcare",
+#              "d.education",
+#              "d.construction",
+#              "d.services",
+#              "d.realestate",
+#              "d.transport",
+#              "Australia", 
+#              "AusMarket",
+              "countryRisk", 
+#              "specHigh", 
+#              "spec.low", 
+#              "IP",
+              "sIPO", 
+              "sMGT", 
+#              "opts.mgt",
+              "sTOP",
+              "sLM", 
+#              "sLM.zero",
+              "escrow", 
+              "r.int", 
+              "d.Underwritten", 
+              "d_OMBB", 
+              "offerRange", 
+              "r_options", 
+#              "broker.share", 
+#              "auditor.share", 
+              "cost", 
+              "r.consideration", 
+              "r.convertible",
+              "r.vendor.sales", 
+#              "r.asset.acq", 
+#              "r.research", 
+#              "r_investment", 
+#              "r.marketing", 
+#              "r.working.cap", 
+#              "no.broker", 
+              "r.current", 
+#              "r.recievables",
+#              "sales_target",
+#              "profit.target", 
+#              "price.target",
+              "l.pb")]
+
+#Saving coefficients
+tbl.lambda.r <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.r) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.r) <- names
+
+####Closing Price
+y <- df2$rclose
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df2$rclose.cv.r <- NA
+df2$rclose.cv.r[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df2$rclose.fit.r <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df2$rclose.fit.r, df2$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#measures of fit
+tbl.lambda.r <- save.fn(1, df2$rclose.fit.r, df2$rclose.cv.r, tbl.lambda.r)
+
+
+
+####1 Week Return
+y <- df2$r1w
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df2$r1w.cv.r <- NA
+df2$r1w.cv.r[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df2$r1w.fit.r <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df2$r1w.fit.r, df2$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#measures of fit
+tbl.lambda.r <- save.fn(2, df2$r1w.fit.r, df2$r1w.cv.r, tbl.lambda.r)
+
+
+
+
+####1 Month Return
+y <- df2$r1m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df2$r1m.cv.r <- NA
+df2$r1m.cv.r[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df2$r1m.fit.r <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df2$r1m.fit.r, df2$r1m, min(cv.out$cvm)^0.5, "r1m")
+
+#measures of fit
+tbl.lambda.r <- save.fn(3, df2$r1m.fit.r, df2$r1m.cv.r, tbl.lambda.r)
+
+
+
+####3 Month Return
+y <- df2$r3m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df2$r3m.cv.r <- NA
+df2$r3m.cv.r[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df2$r3m.fit.r <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df2$r3m.fit.r, df2$r3m, min(cv.out$cvm)^0.5, "r3m")
+
+#measures of fit
+tbl.lambda.r <- save.fn(4, df2$r3m.fit.r, df2$r3m.cv.r, tbl.lambda.r)
+
+
+
+####6 Month Return
+y <- df2$r6m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df2$r6m.cv.r <- NA
+df2$r6m.cv.r[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df2$r6m.fit.r <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df2$r6m.fit.r, df2$r6m, min(cv.out$cvm)^0.5, "r6m")
+
+#measures of fit
+tbl.lambda.r <- save.fn(5, df2$r6m.fit.r, df2$r6m.cv.r, tbl.lambda.r)
+
+
+####9 Month Return
+y <- df2$r9m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df2$r9m.cv.r <- NA
+df2$r9m.cv.r[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df2$r9m.fit.r <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df2$r9m.fit.r, df2$r9m, min(cv.out$cvm)^0.5, "r9m")
+
+#measures of fit
+tbl.lambda.r <- save.fn(6, df2$r9m.fit.r, df2$r9m.cv.r, tbl.lambda.r)
+
+
+####12 Month Return
+y <- df2$r12m
+cv.out <- estimate.fn()
+
+#cross validated predictions
+df2$r12m.cv.r <- NA
+df2$r12m.cv.r[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+
+#fitted values & chart
+df2$r12m.fit.r <- predict(cv.out, as.matrix(x), s = cv.out$lambda.min)
+chart.fit(df2$r12m.fit.r, df2$r12m, min(cv.out$cvm)^0.5, "r12m")
+
+#measures of fit
+tbl.lambda.r <- save.fn(7, df2$r12m.fit.r, df2$r12m.cv.r, tbl.lambda.r)
+
+df2[(nrow(df2)-12):nrow(df2), c("ASX_Code", "rclose.fit.r", "r1w.fit.r", "r1m.fit.r", "r3m.fit.r", "r6m.fit.r", "r9m.fit.r", "r12m.fit.r")]
+
+
+```
+
+
+
+
+```{r Small-revenue companies - levels equation}
+
+x <- subset(x, select = -c(l.pb))
+
+#Saving coefficients
+tbl.lambda.rl <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.rl) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.rl) <- names
+
+####Closing Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$rclose
+#fitted values and chart
+df2$rclose.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$rclose.fit.rl <- predict(lm(rclose~rclose.fit.rl, df2), df2)
+chart.fit(df2$rclose.fit.rl, df2$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#cross validated predictions          
+df2$rclose.cv.rl <- NA
+df2$rclose.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$rclose.cv.rl <- df2$rclose.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$rclose.cv.rl <- (1-0.6)*mean(y, na.rm=TRUE) + 0.6*df2$rclose.cv.rl
+
+#measures of fit
+tbl.lambda.rl <- save.fn(1, df2$rclose.fit.rl, df2$rclose.cv.rl, tbl.lambda.rl)
+
+
+#### 1 Week Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P1week/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r1w
+#fitted values and chart
+df2$r1w.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r1w.fit.rl <- predict(lm(r1w~r1w.fit.rl, df2), df2)
+chart.fit(df2$r1w.fit.rl, df2$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#cross validated predictions          
+df2$r1w.cv.rl <- NA
+df2$r1w.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r1w.cv.rl <- df2$r1w.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r1w.cv.rl <- (1-0.7)*mean(y, na.rm=TRUE) + 0.7*df2$r1w.cv.rl
+
+#measures of fit
+tbl.lambda.rl <- save.fn(2, df2$r1w.fit.rl, df2$r1w.cv.rl, tbl.lambda.rl)
+
+
+
+#### 1 Month Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P1m/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r1m
+#fitted values and chart
+df2$r1m.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r1m.fit.rl <- predict(lm(r1m~r1m.fit.rl, df2), df2)
+chart.fit(df2$r1m.fit.rl, df2$r1m, min(cv.out$cvm)^0.5, "r1m")
+#cross validated predictions          
+df2$r1m.cv.rl <- NA
+df2$r1m.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r1m.cv.rl <- df2$r1m.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r1m.cv.rl <- (1-0.8)*mean(y, na.rm=TRUE) + 0.8*df2$r1m.cv.rl
+#measures of fit
+tbl.lambda.rl <- save.fn(3, df2$r1m.fit.rl, df2$r1m.cv.rl, tbl.lambda.rl)
+
+
+
+#### 3 Month Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P3m/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r3m
+#fitted values and chart
+df2$r3m.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r3m.fit.rl <- predict(lm(r3m~r3m.fit.rl, df2), df2)
+chart.fit(df2$r3m.fit.rl, df2$r3m, min(cv.out$cvm)^0.5, "r3m")
+#cross validated predictions          
+df2$r3m.cv.rl <- NA
+df2$r3m.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r3m.cv.rl <- df2$r3m.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r3m.cv.rl <- (1-0.65)*mean(y, na.rm=TRUE) + 0.65*df2$r3m.cv.rl
+#measures of fit
+tbl.lambda.rl <- save.fn(4, df2$r3m.fit.rl, df2$r3m.cv.rl, tbl.lambda.rl)
+
+
+
+#### 6 Month Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P6m/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r6m
+#fitted values and chart
+df2$r6m.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r6m.fit.rl <- predict(lm(r6m~r6m.fit.rl, df2), df2)
+chart.fit(df2$r6m.fit.rl, df2$r6m, min(cv.out$cvm)^0.5, "r6m")
+#cross validated predictions          
+df2$r6m.cv.rl <- NA
+df2$r6m.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r6m.cv.rl <- df2$r6m.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r6m.cv.rl <- (1-0.8)*mean(y, na.rm=TRUE) + 0.8*df2$r6m.cv.rl
+#measures of fit
+tbl.lambda.rl <- save.fn(5, df2$r6m.fit.rl, df2$r6m.cv.rl, tbl.lambda.rl)
+
+
+
+#### 9 Month Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P9m/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r9m
+#fitted values and chart
+df2$r9m.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r9m.fit.rl <- predict(lm(r9m~r9m.fit.rl, df2), df2)
+chart.fit(df2$r9m.fit.rl, df2$r9m, min(cv.out$cvm)^0.5, "r9m")
+#cross validated predictions          
+df2$r9m.cv.rl <- NA
+df2$r9m.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r9m.cv.rl <- df2$r9m.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r9m.cv.rl <- (1-0.9)*mean(y, na.rm=TRUE) + 0.9*df2$r9m.cv.rl
+#measures of fit
+tbl.lambda.rl <- save.fn(6, df2$r9m.fit.rl, df2$r9m.cv.rl, tbl.lambda.rl)
+
+
+#### 12 Month Price
+y <- log((1000*df2$mcM*df2$Shares/df2$SharesFD*df2$P12m/df2$Pclose+df2$Liab)/df2$Assets)
+cv.out <- estimate.fn()
+y <- df2$r12m
+#fitted values and chart
+df2$r12m.fit.rl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df2$Assets - df2$Liab) - log(1000*df2$mc*df2$Shares/df2$SharesFD)
+df2$r12m.fit.rl <- predict(lm(r12m~r12m.fit.rl, df2), df2)
+chart.fit(df2$r12m.fit.rl, df2$r12m, min(cv.out$cvm)^0.5, "r12m")
+#cross validated predictions          
+df2$r12m.cv.rl <- NA
+df2$r12m.cv.rl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df2$r12m.cv.rl <- df2$r12m.cv.rl - log((1000*df2$mc*df2$Shares/df2$SharesFD + df2$Liab)/df2$Assets)
+df2$r12m.cv.rl <- (1-1)*mean(y, na.rm=TRUE) + 1*df2$r12m.cv.rl
+#measures of fit
+tbl.lambda.rl <- save.fn(7, df2$r12m.fit.rl, df2$r12m.cv.rl, tbl.lambda.rl)
+
+
+#Table of Level Return Forecasts
+df2[(nrow(df2)-12):nrow(df2), c("ASX_Code", "rclose.fit.rl", "r1w.fit.rl", "r1m.fit.rl", "r3m.fit.rl", "r6m.fit.rl", "r9m.fit.rl", "r12m.fit.rl")]
+
+#Averages
+df2$rclose.avg.r <- (df2$rclose.fit.r + df2$rclose.fit.rl)/2
+df2$r1w.avg.r <- (df2$r1w.fit.r + df2$r1w.fit.rl)/2
+df2$r1m.avg.r <- (df2$r1m.fit.r + df2$r1m.fit.rl)/2
+df2$r3m.avg.r <- (df2$r3m.fit.r + df2$r3m.fit.rl)/2
+df2$r6m.avg.r <- (df2$r6m.fit.r + df2$r6m.fit.rl)/2
+df2$r9m.avg.r <- (df2$r9m.fit.r + df2$r9m.fit.rl)/2
+df2$r12m.avg.r <- (df2$r12m.fit.r + df2$r12m.fit.rl)/2
+
+df2[(nrow(df2)-12):nrow(df2), c("ASX_Code", "rclose.avg.r", "r1w.avg.r", "r1m.avg.r", "r3m.avg.r", "r6m.avg.r", "r9m.avg.r", "r12m.avg.r")]
+
+#Global averages
+df2$rclose.t <- (df2$rclose.avg + df2$rclose.avg.n)/2
+df2$r1w.t <- (df2$r1w.avg + df2$r1w.avg.n)/2
+df2$r1m.t <- (df2$r1m.avg + df2$r1m.avg.n)/2
+df2$r3m.t <- (df2$r3m.avg + df2$r3m.avg.n)/2
+df2$r6m.t <- (df2$r6m.avg + df2$r6m.avg.n)/2
+df2$r9m.t <- (df2$r9m.avg + df2$r9m.avg.n)/2
+df2$r12m.t <- (df2$r12m.avg + df2$r12m.avg.n)/2
+
+df1[(nrow(df1)-12):nrow(df1), c("ASX_Code", "rclose.t", "r1w.t", "r1m.t", "r3m.t", "r6m.t", "r9m.t", "r12m.t")]
+
+```
+
+
+
+```{r Equation for High Revenue Companies}
+
+df3 <- subset(data, Sales_A >= 10000)
+
+data_old <- data
+data <- df3
+charts.fn(data$rclose, mean(data$rclose, na.rm=TRUE))
+charts.fn(data$r12m, mean(data$r12m, na.rm=TRUE))
+data <- data_old
+
+chart.fit <- function(fit, actual, se, title) {  
+plot(fit, actual, main=title)
+text(fit, actual, labels=df3$ASX_Code, cex=0.5, pos=2)
+abline(a=0, b=1)
+abline(a=-se, b=1, col="red")
+abline(a=se, b=1, col="red")
+abline(h=0) }
+
+
+
+df3$r.ebit <- df3$EBIT_A/df3$Assets
+df3$r.cfo <- df3$CFO_A/df3$Assets
+                
+x <- df3[, c("i_assets", 
+#              "i.mc",
+              "l.years", 
+#              "sales_zero", 
+              "ebit.neg", 
+#              "no.ebit",
+#              "no.cfo",
+              "sales.assets", 
+#              "r.ebit.zero", 
+#              "r.ebit.sales",
+#              "r.cfo.zero",
+#              "r.cfo.sales",
+              "r.ebit", 
+              "r.cfo",
+              "fcstEBIT", 
+              "r.cash", 
+              "shareRaise",
+              "div.zero", 
+              "Dividend", 
+#              "r.rnd", 
+#              "r_inv",
+#              "d.prof.services", 
+#              "d.information",
+#              "d.retail",
+#              "d.wholesale", 
+#              "d.egw",
+#              "d.fin",
+#              "d.healthcare",
+#              "d.education",
+#              "d.construction",
+#              "d.services",
+#              "d.realestate",
+#              "d.transport",
+              "Australia", 
+              "AusMarket",
+              "countryRisk", 
+#              "specHigh", 
+#              "spec.low", 
+#              "IP",
+              "sIPO", 
+              "sMGT", 
+#              "opts.mgt",
+              "sTOP",
+#              "sLM", 
+#              "sLM.zero",
+              "escrow", 
+              "r.int", 
+              "d.Underwritten", 
+              "d_OMBB", 
+              "offerRange", 
+              "r_options", 
+#              "broker.share", 
+#              "auditor.share", 
+              "cost", 
+#              "r.consideration", 
+#              "r.convertible",
+              "r.vendor.sales", 
+              "r.asset.acq", 
+#              "r.research", 
+#              "r_investment", 
+#              "r.marketing", 
+#              "r.working.cap", 
+#              "no.broker", 
+              "r.current", 
+              "r.recievables",
+#              "sales_target",
+#              "profit.target", 
+#              "price.target",
+              "l.pb")]
+
+#Saving coefficients
+tbl.lambda <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda) <- names
+
+
+
+####Closing Price
+y <- df3$rclose
+
+```
+
+
+
+```{r Large-revenue companies - levels equation}
+
+x <- subset(x, select = -c(l.pb))
+
+#Saving coefficients
+tbl.lambda.pl <- matrix(data = NA, nrow = (ncol(x)+6), ncol = 7)
+colnames(tbl.lambda.pl) <- c("rclose", "r1w", "r1m", "r3m", "r6m", "r9m", "r12m")
+names <- c("const", colnames(x), c("", "r2", "r2.cv", "se", "st.dev"))
+rownames(tbl.lambda.pl) <- names
+
+####Closing Price
+y <- log((1000*df3$mcM*df3$Shares/df3$SharesFD+df3$Liab)/df3$Assets)
+cv.out <- estimate.fn()
+y <- df3$rclose
+#fitted values and chart
+df3$rclose.fit.pl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df3$Assets - df3$Liab) - log(1000*df3$mc*df3$Shares/df3$SharesFD)
+df3$rclose.fit.pl <- predict(lm(rclose~rclose.fit.pl, df3), df3)
+chart.fit(df3$rclose.fit.pl, df3$rclose, min(cv.out$cvm)^0.5, "rclose")
+
+#cross validated predictions          
+df3$rclose.cv.pl <- NA
+df3$rclose.cv.pl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df3$rclose.cv.pl <- df3$rclose.cv.pl - log((1000*df3$mc*df3$Shares/df3$SharesFD + df3$Liab)/df3$Assets)
+df3$rclose.cv.pl <- (1-0.2)*mean(y, na.rm=TRUE) + 0.2*df3$rclose.cv.pl
+
+#measures of fit
+tbl.lambda.pl <- save.fn(1, df3$rclose.fit.pl, df3$rclose.cv.pl, tbl.lambda.pl)
+
+
+#### 1 Week Price
+y <- log((1000*df3$mcM*df3$Shares/df3$SharesFD*df3$P1week/df3$Pclose+df3$Liab)/df3$Assets)
+cv.out <- estimate.fn()
+y <- df3$r1w
+#fitted values and chart
+df3$r1w.fit.pl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df3$Assets - df3$Liab) - log(1000*df3$mc*df3$Shares/df3$SharesFD)
+df3$r1w.fit.pl <- predict(lm(r1w~r1w.fit.pl, df3), df3)
+chart.fit(df3$r1w.fit.pl, df3$r1w, min(cv.out$cvm)^0.5, "r1w")
+
+#cross validated predictions          
+df3$r1w.cv.pl <- NA
+df3$r1w.cv.pl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df3$r1w.cv.pl <- df3$r1w.cv.pl - log((1000*df3$mc*df3$Shares/df3$SharesFD + df3$Liab)/df3$Assets)
+df3$r1w.cv.pl <- (1-0.25)*mean(y, na.rm=TRUE) + 0.25*df3$r1w.cv.pl
+
+#measures of fit
+tbl.lambda.pl <- save.fn(2, df3$r1w.fit.pl, df3$r1w.cv.pl, tbl.lambda.pl)
+
+
+
+#### 1 Month Price
+y <- log((1000*df3$mcM*df3$Shares/df3$SharesFD*df3$P1m/df3$Pclose+df3$Liab)/df3$Assets)
+cv.out <- estimate.fn()
+y <- df3$r1m
+#fitted values and chart
+df3$r1m.fit.pl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df3$Assets - df3$Liab) - log(1000*df3$mc*df3$Shares/df3$SharesFD)
+df3$r1m.fit.pl <- predict(lm(r1m~r1m.fit.pl, df3), df3)
+chart.fit(df3$r1m.fit.pl, df3$r1m, min(cv.out$cvm)^0.5, "r1m")
+#cross validated predictions          
+df3$r1m.cv.pl <- NA
+df3$r1m.cv.pl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df3$r1m.cv.pl <- df3$r1m.cv.pl - log((1000*df3$mc*df3$Shares/df3$SharesFD + df3$Liab)/df3$Assets)
+df3$r1m.cv.pl <- (1-0.3)*mean(y, na.rm=TRUE) + 0.3*df3$r1m.cv.pl
+#measures of fit
+tbl.lambda.pl <- save.fn(3, df3$r1m.fit.pl, df3$r1m.cv.pl, tbl.lambda.pl)
+
+
+
+#### 3 Month Price
+y <- log((1000*df3$mcM*df3$Shares/df3$SharesFD*df3$P3m/df3$Pclose+df3$Liab)/df3$Assets)
+cv.out <- estimate.fn()
+y <- df3$r3m
+#fitted values and chart
+df3$r3m.fit.pl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df3$Assets - df3$Liab) - log(1000*df3$mc*df3$Shares/df3$SharesFD)
+df3$r3m.fit.pl <- predict(lm(r3m~r3m.fit.pl, df3), df3)
+chart.fit(df3$r3m.fit.pl, df3$r3m, min(cv.out$cvm)^0.5, "r3m")
+#cross validated predictions          
+df3$r3m.cv.pl <- NA
+df3$r3m.cv.pl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df3$r3m.cv.pl <- df3$r3m.cv.pl - log((1000*df3$mc*df3$Shares/df3$SharesFD + df3$Liab)/df3$Assets)
+df3$r3m.cv.pl <- (1-0.35)*mean(y, na.rm=TRUE) + 0.35*df3$r3m.cv.pl
+#measures of fit
+tbl.lambda.pl <- save.fn(4, df3$r3m.fit.pl, df3$r3m.cv.pl, tbl.lambda.pl)
+
+
+
+#### 6 Month Price
+y <- log((1000*df3$mcM*df3$Shares/df3$SharesFD*df3$P6m/df3$Pclose+df3$Liab)/df3$Assets)
+cv.out <- estimate.fn()
+y <- df3$r6m
+#fitted values and chart
+df3$r6m.fit.pl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df3$Assets - df3$Liab) - log(1000*df3$mc*df3$Shares/df3$SharesFD)
+df3$r6m.fit.pl <- predict(lm(r6m~r6m.fit.pl, df3), df3)
+chart.fit(df3$r6m.fit.pl, df3$r6m, min(cv.out$cvm)^0.5, "r6m")
+#cross validated predictions          
+df3$r6m.cv.pl <- NA
+df3$r6m.cv.pl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df3$r6m.cv.pl <- df3$r6m.cv.pl - log((1000*df3$mc*df3$Shares/df3$SharesFD + df3$Liab)/df3$Assets)
+df3$r6m.cv.pl <- (1-0.5)*mean(y, na.rm=TRUE) + 0.5*df3$r6m.cv.pl
+#measures of fit
+tbl.lambda.pl <- save.fn(5, df3$r6m.fit.pl, df3$r6m.cv.pl, tbl.lambda.pl)
+
+
+
+#### 9 Month Price
+y <- log((1000*df3$mcM*df3$Shares/df3$SharesFD*df3$P9m/df3$Pclose+df3$Liab)/df3$Assets)
+cv.out <- estimate.fn()
+y <- df3$r9m
+#fitted values and chart
+df3$r9m.fit.pl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df3$Assets - df3$Liab) - log(1000*df3$mc*df3$Shares/df3$SharesFD)
+df3$r9m.fit.pl <- predict(lm(r9m~r9m.fit.pl, df3), df3)
+chart.fit(df3$r9m.fit.pl, df3$r9m, min(cv.out$cvm)^0.5, "r9m")
+#cross validated predictions          
+df3$r9m.cv.pl <- NA
+df3$r9m.cv.pl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df3$r9m.cv.pl <- df3$r9m.cv.pl - log((1000*df3$mc*df3$Shares/df3$SharesFD + df3$Liab)/df3$Assets)
+df3$r9m.cv.pl <- (1-0.5)*mean(y, na.rm=TRUE) + 0.5*df3$r9m.cv.pl
+#measures of fit
+tbl.lambda.pl <- save.fn(6, df3$r9m.fit.pl, df3$r9m.cv.pl, tbl.lambda.pl)
+
+
+#### 12 Month Price
+y <- log((1000*df3$mcM*df3$Shares/df3$SharesFD*df3$P12m/df3$Pclose+df3$Liab)/df3$Assets)
+cv.out <- estimate.fn()
+y <- df3$r12m
+#fitted values and chart
+df3$r12m.fit.pl <- log(exp(predict(cv.out, as.matrix(x), s = cv.out$lambda.min))*df3$Assets - df3$Liab) - log(1000*df3$mc*df3$Shares/df3$SharesFD)
+df3$r12m.fit.pl <- predict(lm(r12m~r12m.fit.pl, df3), df3)
+chart.fit(df3$r12m.fit.pl, df3$r12m, min(cv.out$cvm)^0.5, "r12m")
+#cross validated predictions          
+df3$r12m.cv.pl <- NA
+df3$r12m.cv.pl[1:nrow(cv.out$fit.preval)] <- cv.out$fit.preval[, which(cv.out$lambda == cv.out$lambda.min, arr.ind=TRUE)] 
+df3$r12m.cv.pl <- df3$r12m.cv.pl - log((1000*df3$mc*df3$Shares/df3$SharesFD + df3$Liab)/df3$Assets)
+df3$r12m.cv.pl <- (1-0.5)*mean(y, na.rm=TRUE) + 0.5*df3$r12m.cv.pl
+#measures of fit
+tbl.lambda.pl <- save.fn(7, df3$r12m.fit.pl, df3$r12m.cv.pl, tbl.lambda.pl)
+
+
+#Table of Level Return Forecasts
+df3[(nrow(df3)-12):nrow(df3), c("ASX_Code", "rclose.fit.pl", "r1w.fit.pl", "r1m.fit.pl", "r3m.fit.pl", "r6m.fit.pl", "r9m.fit.pl", "r12m.fit.pl")]
+
+#Averages
+df3$rclose.avg.r <- (df3$rclose.fit.r + df3$rclose.fit.pl)/2
+df3$r1w.avg.r <- (df3$r1w.fit.r + df3$r1w.fit.pl)/2
+df3$r1m.avg.r <- (df3$r1m.fit.r + df3$r1m.fit.pl)/2
+df3$r3m.avg.r <- (df3$r3m.fit.r + df3$r3m.fit.pl)/2
+df3$r6m.avg.r <- (df3$r6m.fit.r + df3$r6m.fit.pl)/2
+df3$r9m.avg.r <- (df3$r9m.fit.r + df3$r9m.fit.pl)/2
+df3$r12m.avg.r <- (df3$r12m.fit.r + df3$r12m.fit.pl)/2
+
+df3[(nrow(df3)-12):nrow(df3), c("ASX_Code", "rclose.avg.r", "r1w.avg.r", "r1m.avg.r", "r3m.avg.r", "r6m.avg.r", "r9m.avg.r", "r12m.avg.r")]
+
+#Global averages
+df3$rclose.t <- (df3$rclose.avg + df3$rclose.avg.n)/2
+df3$r1w.t <- (df3$r1w.avg + df3$r1w.avg.n)/2
+df3$r1m.t <- (df3$r1m.avg + df3$r1m.avg.n)/2
+df3$r3m.t <- (df3$r3m.avg + df3$r3m.avg.n)/2
+df3$r6m.t <- (df3$r6m.avg + df3$r6m.avg.n)/2
+df3$r9m.t <- (df3$r9m.avg + df3$r9m.avg.n)/2
+df3$r12m.t <- (df3$r12m.avg + df3$r12m.avg.n)/2
+
+df1[(nrow(df1)-12):nrow(df1), c("ASX_Code", "rclose.t", "r1w.t", "r1m.t", "r3m.t", "r6m.t", "r9m.t", "r12m.t")]
+
+```
+
+
+```{r Writing Files}
+
+j <- data[, c("ASX_Code", "Actual_List", "rclose", "r1m", "r3m", "r6m", "r9m", "r12m", "rclose.fit", "r1w.fit", "r1m.fit", "r3m.fit", "r6m.fit", "r9m.fit", "r12m.fit")]
+
+j1 <- data[, c("ASX_Code", "Actual_List", "rclose.level", "r1w.level", "r1m.level", "r3m.level", "r6m.level", "r9m.level", "r12m.level")]
+
+j2 <- df1[, c("ASX_Code", "rclose.no.rev.fit", "r1w.no.rev.fit", "r1m.no.rev.fit", "r3m.no.rev.fit", "r6m.no.rev.fit", "r9m.no.rev.fit", "r12m.no.rev.fit")]
+
+j3 <- df2[, c("ASX_Code", "rclose.rev.fit", "r1w.rev.fit", "r1m.rev.fit", "r3m.rev.fit", "r6m.rev.fit", "r9m.rev.fit", "r12m.rev.fit")]
+
+j4 <- df3[, c("ASX_Code", "rclose.ebit.fit", "r1w.ebit.fit", "r1m.ebit.fit", "r3m.ebit.fit", "r6m.ebit.fit", "r9m.ebit.fit", "r12m.ebit.fit")]
+
+j5 <- merge(j, j1, by="ASX_Code", all=TRUE)
+j6 <- merge(j5, j2, by="ASX_Code", all=TRUE)
+j7 <- merge(j6, j3, by="ASX_Code", all="TRUE")
+j8 <- merge(j7, j4, by = "ASX_Code", all = "TRUE")
+
+j8 <- j8[order(j8$Actual_List.x), ]
+j8 <- j8[24:nrow(j8), ]
+write.csv(j8, file="junk.csv")
+
+```
+
+
+
+
