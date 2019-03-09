@@ -3,6 +3,8 @@ title: "Industrials"
 author: "Brett Ryder"
 date: "30 January 2017"
 output: html_document
+editor_options: 
+  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
@@ -963,15 +965,14 @@ data <- subset(data, !(ASX_Code %in% c("BFG", "OCA", "NZK", "TGH", "PGL", "PPH")
 
 
 #Constructing Data
-data$pb0 <- log(1000*data$mc*data$Shares/data$SharesFD) - log(data$Assets)
-data$pb <- log(1000*data$mcM*data$Shares/data$SharesFD+data$Liab)-log(data$Assets)
-data$pb1w <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P1week/data$Pclose+data$Liab)-log(data$Assets)
-data$pb1m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P1m/data$Pclose+data$Liab)-log(data$Assets)
-data$pb3m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P3m/data$Pclose+data$Liab)-log(data$Assets)
-data$pb6m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P6m/data$Pclose+data$Liab)-log(data$Assets)
-data$pb9m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P9m/data$Pclose+data$Liab)-log(data$Assets)
-data$pb12m <- log(1000*data$mcM*data$Shares/data$SharesFD*data$P12m/data$Pclose+data$Liab)-log(data$Assets)
-
+data$pb0 <- log(1000*data$Shares*data$Price + data$Liab) - log(data$Assets)
+data$pb <- log(1000*data$Shares*data$Pclose + data$Liab)-log(data$Assets)
+data$pb1w <- log(1000*data$Shares*data$P1week + data$Liab)-log(data$Assets)
+data$pb1m <- log(1000*data$Shares*data$P1m + data$Liab)-log(data$Assets)
+data$pb3m <- log(1000*data$Shares*data$P3m + data$Liab)-log(data$Assets)
+data$pb6m <- log(1000*data$Shares*data$P6m + data$Liab)-log(data$Assets)
+data$pb9m <- log(1000*data$Shares*data$P9m + data$Liab)-log(data$Assets)
+data$pb12m <- log(1000*data$Shares*data$P12m + data$Liab)-log(data$Assets)
 
 #Constructing Data
 data$size <- 1/((data$Assets/1000 + data$mc + data$Liab/1000 + data$ev)/3)
@@ -1041,7 +1042,7 @@ data$r.ebit.cfo <- (data$EBIT_A/2 + data$CFO_A/2)/data$Assets
              
 x <- data[, c("i_assets", 
               "size",
-               "i.mc",
+             "i.mc",
               "gp",
               "i.ev",
               "l.years", 
@@ -1684,6 +1685,167 @@ barplot(rSquaredCV[2:10, 1:8], beside = TRUE, main = "CV Rsquared")
 barplot(rSquaredCV[12:20, 1:8], beside = TRUE, main = "CV RMSE")
 
 ```
+
+
+
+```{r Levels Equation}
+
+
+#Dependent variable
+y <- subset(data, select = c("pb", "pb1w", "pb1m", "pb3m", "pb6m", "pb9m", "pb12m"))
+
+x <- data[, c("i_assets",
+              "r.vendor.sales", 
+              "shareRaise",
+              "r.cash",
+              "r.current",
+              "d_man",
+              "d_ag",
+              "countryRisk",
+              "ebit.neg",
+              "no.broker",
+              "sTOP",
+              "sMGT",
+              "sIPO",
+              "r.int",
+              "r_options",
+              "cost",
+              "sales_zero",
+              "sales_target",
+              "sales.assets",
+              "r.cfo",
+              "r.asset.acq",
+              "div.zero",
+              "Dividend")]
+
+# Split the data into training and test set
+smp_siz <- floor(0.75*nrow(x))
+set.seed(8)   
+train_ind <- sample(seq_len(nrow(x)),size = smp_siz) 
+train.data <- x[train_ind, ] 
+test.data <- x[-train_ind, ] 
+train.y <- y[train_ind, ]
+test.y <- y[-train_ind, ]
+train.labels <- data$ASX_Code[train_ind]
+test.labels <- data$ASX_Code[-train_ind]
+
+set.seed(8)
+ctrl <- trainControl("cv", number = 10, savePredictions = "final")
+
+
+for (i in 1:7) {
+j <- j + 1
+# Fit the model on the training set
+set.seed(8)
+
+    if(i == 1){
+      train.data <- cbind(train.y[, 1], train.data) 
+      test.data <- cbind(test.y[, 1], test.data)
+    } else {
+      train.data[, 1] <- train.y[, i]
+      test.data[, 1] <- test.y[, i]
+    }
+
+name <- colnames(train.y)[i]
+colnames(train.data)[1] <- "return"
+colnames(test.data)[1] <- "return"
+
+#Linear Model
+set.seed(8)
+lin.mod <- train(return ~ ., 
+         data = train.data, 
+         method = "lm",
+         trControl = ctrl,
+         na.action = na.omit)
+# Make predictions on the test data
+predictions <- lin.mod %>% predict(test.data) 
+predictions <- predictions + log(test.data$Assets) - log(test.data$Shares) - log(test.data$Price)
+plot.fn("LIN")
+rSquared <- write.fn(14, 25, 36, 47)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- lin.mod$pred[order(lin.mod$pred$rowIndex), "pred" ]
+colnames(fits)[j] <- paste0("LIN", name)
+colnames(fitsCV)[j] <- paste0("LIN", name)
+j <- j + 1
+
+#AIC Linear Model
+set.seed(8)
+shuffleData <- train.data
+shuffleData <- shuffleData[is.na(shuffleData$return) == "FALSE", ]
+#Create 10 equally size folds
+folds <- cut(seq(1, nrow(shuffleData)), breaks = 10, labels = FALSE)
+shuffleData$pred <- rep(0, nrow(shuffleData))
+for(k in 1:10){
+    testIndexes <- which(folds == k, arr.ind = TRUE)
+    test <- shuffleData[testIndexes, ]
+    train <- shuffleData[-testIndexes, ]
+    lin.mod.aic <- step(lm(return ~ .-pred, 
+                           data = train,
+                           scope = list(lower = ~ 1, upper = ~ .-pred), 
+                           direction = "both"))
+    pred <- predict(lin.mod.aic, test)
+    shuffleData$pred[testIndexes] <- pred
+}
+shuffleData$rowIndex <- as.numeric(rownames(shuffleData))
+lin.mod.aic <- step(lm(return ~ ., 
+                           data = train.data,
+                           scope = list(lower = ~ 1, upper = ~ .), 
+                           direction = "both"))
+# Make predictions on the test data
+predictions <- lin.mod.aic %>% predict(test.data)
+plot.fn("AIC")
+rSquared <- write.fn(15, 26, 37, 48)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- shuffleData$pred
+colnames(fits)[j] <- paste0("AIC", name)
+colnames(fitsCV)[j] <- paste0("AIC", name)
+j <- j + 1
+
+
+#BIC Linear Model
+set.seed(8)
+shuffleData <- train.data
+shuffleData <- shuffleData[is.na(shuffleData$return) == "FALSE", ]
+#Create 10 equally size folds
+folds <- cut(seq(1, nrow(shuffleData)), breaks = 10, labels = FALSE)
+shuffleData$pred <- rep(0, nrow(shuffleData))
+for(k in 1:10){
+    testIndexes <- which(folds == k, arr.ind = TRUE)
+    test <- shuffleData[testIndexes, ]
+    train <- shuffleData[-testIndexes, ]
+    lin.mod.bic <- step(lm(return ~ .-pred, 
+                           data = train,
+                           scope = list(lower = ~ 1, upper = ~ .-pred), 
+                           direction = "both",
+                           k = log(n)))
+    pred <- predict(lin.mod.aic, test)
+    shuffleData$pred[testIndexes] <- pred
+}
+shuffleData$rowIndex <- as.numeric(rownames(shuffleData))
+lin.mod.bic <- step(lm(return ~ ., 
+                           data = train.data,
+                           scope = list(lower = ~ 1, upper = ~ .), 
+                           direction = "both",
+                           k = log(n)))
+# Make predictions on the test data
+predictions <- lin.mod.bic %>% predict(test.data)
+plot.fn("BIC")
+rSquared <- write.fn(16, 27, 38, 49)
+fits[, j] <- predictions
+fitsCV[1:(nrow(train.data) - sum(is.na(train.data$return))), j] <- shuffleData$pred
+colnames(fits)[j] <- paste0("BIC", name)
+colnames(fitsCV)[j] <- paste0("BIC", name)
+j <- j + 1
+
+}
+
+
+```
+
+
+
+
+
 
 
 
